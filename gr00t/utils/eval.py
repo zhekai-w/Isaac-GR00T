@@ -44,10 +44,12 @@ def calc_mse_for_single_trajectory(
     plot=False,
     plot_state=False,
     save_plot_path=None,
+    filters=None,  # list of callables, one per action dim, or None
 ):
     state_joints_across_time = []
     gt_action_across_time = []
     pred_action_across_time = []
+    filtered_action_across_time = []
 
     for step_count in range(steps):
         data_point = None
@@ -73,6 +75,10 @@ def calc_mse_for_single_trajectory(
                 )
                 pred_action_across_time.append(concat_pred_action)
 
+                if filters is not None:
+                    filtered = np.array([filters[k](concat_pred_action[k]) for k in range(len(filters))])
+                    filtered_action_across_time.append(filtered)
+
                 concat_gt_action = np.concatenate(
                     [data_point[f"action.{key}"][j] for key in modality_keys], axis=0
                 )
@@ -83,6 +89,10 @@ def calc_mse_for_single_trajectory(
     gt_action_across_time = np.array(gt_action_across_time)[:steps]
     pred_action_across_time = np.array(pred_action_across_time)[:steps]
     assert gt_action_across_time.shape == pred_action_across_time.shape
+
+    filtered_action_across_time = (
+        np.array(filtered_action_across_time)[:steps] if filtered_action_across_time else None
+    )
 
     # calc MSE across time
     mse = np.mean((gt_action_across_time - pred_action_across_time) ** 2)
@@ -104,6 +114,7 @@ def calc_mse_for_single_trajectory(
             "state_joints_across_time": state_joints_across_time,
             "gt_action_across_time": gt_action_across_time,
             "pred_action_across_time": pred_action_across_time,
+            "filtered_action_across_time": filtered_action_across_time,
             "modality_keys": modality_keys,
             "traj_id": traj_id,
             "mse": mse,
@@ -130,6 +141,7 @@ def plot_trajectory(
     state_joints_across_time = info["state_joints_across_time"]
     gt_action_across_time = info["gt_action_across_time"]
     pred_action_across_time = info["pred_action_across_time"]
+    filtered_action_across_time = info.get("filtered_action_across_time")
     modality_keys = info["modality_keys"]
     traj_id = info["traj_id"]
     mse = info["mse"]
@@ -160,7 +172,9 @@ def plot_trajectory(
         if state_joints_across_time.shape == gt_action_across_time.shape:
             ax.plot(state_joints_across_time[:, i], label="state joints", alpha=0.7)
         ax.plot(gt_action_across_time[:, i], label="gt action", linewidth=2)
-        ax.plot(pred_action_across_time[:, i], label="pred action", linewidth=2)
+        ax.plot(pred_action_across_time[:, i], label="pred action", linewidth=2, alpha=0.5)
+        if filtered_action_across_time is not None:
+            ax.plot(filtered_action_across_time[:, i], label="filtered action", linewidth=2)
 
         # put a dot every ACTION_HORIZON
         for j in range(0, steps, action_horizon):

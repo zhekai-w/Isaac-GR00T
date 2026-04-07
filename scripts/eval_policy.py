@@ -13,12 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import os
+import time
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Literal
 
 import numpy as np
 import tyro
+
+sys.path.insert(0, os.path.dirname(__file__))
+from eval_policy_hardware import OneEuroFilter
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
@@ -95,6 +101,18 @@ class ArgsConfig:
     plot_state: bool = False
     """Whether to plot the state."""
 
+    filter: bool = False
+    """Apply One Euro Filter to predicted actions before plotting."""
+
+    filter_mincutoff: float = 1.0
+    """One Euro Filter min cutoff frequency (Hz). Lower = more smoothing."""
+
+    filter_beta: float = 0.1
+    """One Euro Filter speed coefficient. Higher = less lag when moving fast."""
+
+    dt: float = 0.05
+    """Time step between actions (seconds), used to set filter frequency."""
+
 
 def main(args: ArgsConfig):
     data_config = load_data_config(args.data_config)
@@ -155,8 +173,39 @@ def main(args: ArgsConfig):
     print("Running on all trajs with modality keys:", args.modality_keys)
 
     all_mse = []
+    all_inference_times = []
+    total_start = time.perf_counter()
+
     for traj_id in range(args.start_traj, args.start_traj + args.trajs):
         print("Running trajectory:", traj_id)
+
+        # Time each inference step manually
+        traj_inference_times = []
+        for step_count in range(args.steps):
+            if step_count % args.action_horizon == 0:
+                data_point = dataset.get_step_data(traj_id, step_count)
+                t0 = time.perf_counter()
+                _ = policy.get_action(data_point)
+                t1 = time.perf_counter()
+                elapsed = t1 - t0
+                traj_inference_times.append(elapsed)
+                print(f"  Step {step_count}: inference took {elapsed:.4f}s")
+
+        all_inference_times.extend(traj_inference_times)
+
+        # Build per-dim filters for this trajectory (reset state between trajs)
+        filters = None
+        if args.filter:
+            # Determine action dim from a sample step
+            sample = dataset.get_step_data(traj_id, 0)
+            action_dim = sum(
+                np.atleast_1d(sample[f"action.{key}"][0]).shape[0]
+                for key in args.modality_keys
+            )
+            freq = 1.0 / args.dt
+            filters = [OneEuroFilter(freq, args.filter_mincutoff, args.filter_beta) for _ in range(action_dim)]
+
+        # Run the full eval (with MSE + plotting)
         mse = calc_mse_for_single_trajectory(
             policy,
             dataset,
@@ -167,10 +216,20 @@ def main(args: ArgsConfig):
             plot=args.plot,
             plot_state=args.plot_state,
             save_plot_path=args.save_plot_path,
+            filters=filters,
         )
         print("MSE:", mse)
         all_mse.append(mse)
-    print("Average MSE across all trajs:", np.mean(all_mse))
+
+    total_elapsed = time.perf_counter() - total_start
+
+    print("\n--- Timing Summary ---")
+    print(f"Total inference calls: {len(all_inference_times)}")
+    print(f"Mean inference time:   {np.mean(all_inference_times):.4f}s")
+    print(f"Min inference time:    {np.min(all_inference_times):.4f}s")
+    print(f"Max inference time:    {np.max(all_inference_times):.4f}s")
+    print(f"Total wall time:       {total_elapsed:.2f}s")
+    print(f"Average MSE across all trajs: {np.mean(all_mse)}")
     print("Done")
     exit()
 

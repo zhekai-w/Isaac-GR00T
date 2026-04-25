@@ -115,10 +115,14 @@ wandb
 # Playground
 playground/
 
-# Hydra 
+# Hydra
 .hydra/
 
 # Data
 demo_data/gr00t-gr1-apple-to-shelf/
 tmp/
 output/
+
+# Zack ignore
+.claude/
+attention_outputs/

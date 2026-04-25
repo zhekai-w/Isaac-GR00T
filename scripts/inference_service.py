@@ -97,7 +97,7 @@ class ArgsConfig:
     client: bool = False
     """Whether to run the client."""
 
-    denoising_steps: int = 4
+    denoising_steps: int = 10
     """The number of denoising steps to use."""
 
     api_token: str = None

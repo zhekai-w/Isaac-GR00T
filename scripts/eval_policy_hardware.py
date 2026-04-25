@@ -24,6 +24,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from control_msgs.action import FollowJointTrajectory, GripperCommand
+from std_msgs.msg import Float64MultiArray
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
@@ -57,7 +58,7 @@ class ArgsConfig:
     filter: bool = True
     filter_mincutoff: float = 1.0  # Hz — lower = more smoothing
     filter_beta: float = 0.1       # speed coefficient — higher = less lag when moving fast
-    send_mode: Literal["single", "chunk"] = "single"
+    send_mode: Literal["single", "chunk"] = "chunk"
 
 
 class OneEuroFilter:
@@ -109,9 +110,15 @@ class UR5HardwareNode(Node):
             GripperCommand,
             "/gripper/robotiq_gripper_controller/gripper_cmd",
         )
+        # Publisher: forward_position_controller (used for single-step mode)
+        self._fwd_pos_pub = self.create_publisher(
+            Float64MultiArray,
+            "/forward_position_controller/commands",
+            1,
+        )
 
         # Joint order matching data_collect.py
-        self.joint_names = [
+        self.scaled_joint_names = [
             "shoulder_lift_joint",
             "elbow_joint",
             "wrist_1_joint",
@@ -120,34 +127,48 @@ class UR5HardwareNode(Node):
             "shoulder_pan_joint",
         ]
 
-    def send_single_action(self, arm_positions, dt):
-        """Send a single joint position and wait for execution to complete."""
+    def send_single_action(self, arm_positions):
+        """Send a single joint position via forward_position_controller (fire-and-forget)."""
+        msg = Float64MultiArray()
+        arm_positions = np.atleast_1d(arm_positions)
+        # reorder for forward_position_controller 
+        msg.data = arm_positions[[5, 0, 1, 2, 3, 4]].tolist()  # shoulder_pan last → first
+        self._fwd_pos_pub.publish(msg)
+
+    def send_single_action_scaled_joint(self, arm_positions, dt, wait: bool = False):
+        """Send a single joint position as a 1-point trajectory."""
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = self.joint_names
+        goal.trajectory.joint_names = self.scaled_joint_names
         point = JointTrajectoryPoint()
         point.positions = np.atleast_1d(arm_positions).tolist()
-        # point.time_from_start = Duration(sec=0, nanosec=int(0.5 * 1e9))
+        point.time_from_start = Duration(sec=int(dt), nanosec=int((dt % 1) * 1e9))
         goal.trajectory.points.append(point)
-        self._traj_action.send_goal_async(goal)
+        future = self._traj_action.send_goal_async(goal)
 
-        # future = self._traj_action.send_goal_async(goal)
-        # while not future.done():
-        #     time.sleep(0.01) 
-        # goal_handle = future.result()  # blocks until goal accepted (spin thread resolves)
+        if not wait:
+            return True
 
-        # if goal_handle is None or not goal_handle.accepted:
-        #     self.get_logger().error("Trajectory goal rejected")
-        #     return
+        while not future.done():
+            time.sleep(0.01)
+        goal_handle = future.result()
 
-        # result_future = goal_handle.get_result_async()
-        # while not result_future.done():
-        #     time.sleep(0.01)  # wait for execution to complete (spin thread resolves)
-        # # result_future.result()  # blocks until trajectory execution completes
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error("Trajectory goal rejected")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        while not result_future.done():
+            time.sleep(0.01)
+
+        result = result_future.result().result
+        if result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+            return True
+        return False
 
     def send_chunk_action(self, arm_actions, dt):
         """Send full action chunk as one trajectory goal; controller spline-interpolates."""
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = self.joint_names
+        goal.trajectory.joint_names = self.scaled_joint_names
         for i, positions in enumerate(arm_actions):
             point = JointTrajectoryPoint()
             point.positions = np.atleast_1d(positions).tolist()
@@ -270,9 +291,10 @@ def main(args: ArgsConfig):
                     ur5.send_chunk_action(arm_chunk, args.dt)
                 else:  # "single"
                     for arm_pos, grip_pos in zip(arm_chunk, grip_chunk):
-                        ur5.send_single_action(arm_pos, args.dt)
+                        # ur5.send_single_action(arm_pos)
+                        ur5.send_single_action_scaled_joint(arm_pos, dt=0.3, wait=False)
                         ur5.send_gripper_command(grip_pos, max_effort=args.gripper_max_effort)
-                        time.sleep(args.dt)
+                        # time.sleep(args.dt)
 
                 print(f"  Step {step}: inference={t_infer:.4f}s")
     finally:

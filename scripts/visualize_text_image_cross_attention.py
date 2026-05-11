@@ -9,6 +9,10 @@ Usage:
     python scripts/visualize_text_image_cross_attention.py \
         --image_path scripts/frame_000000.png \
         --text_query "pick up the red cup"
+
+    python scripts/visualize_text_image_cross_attention.py \
+        --image_path ~/work/videos/default_exposure.mp4 \
+        --text_query "banana" --frame_stride 100 --per_head
 """
 
 import argparse
@@ -16,6 +20,7 @@ import math
 import os
 import sys
 
+import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -235,6 +240,19 @@ def process_image(args, image_path, processor, model, device, image=None, label=
                             num_total_layers=num_layers)
 
 
+def _make_rgba_heatmap(heatmap_grid, img_size, max_alpha=0.55):
+    """Normalize heatmap, resize to img_size (W,H), return RGBA array with dynamic alpha."""
+    W, H = img_size
+    h = heatmap_grid.astype(np.float32)
+    h_min, h_max = h.min(), h.max()
+    h = (h - h_min) / (h_max - h_min) if h_max > h_min else np.zeros_like(h)
+    pil_h = Image.fromarray((h * 255).astype(np.uint8)).resize((W, H), Image.NEAREST)
+    h_resized = np.array(pil_h) / 255.0
+    rgba = cm.cool(h_resized)  # (H, W, 4)
+    rgba[..., 3] = h_resized * max_alpha
+    return rgba
+
+
 def _plot_head_averaged(attn_map, token_labels, grid_dim, image, image_path, args,
                         num_total_layers=None, head_idx=None):
     """One subplot per text token, head-averaged."""
@@ -250,9 +268,9 @@ def _plot_head_averaged(attn_map, token_labels, grid_dim, image, image_path, arg
         zip(token_labels, [axes[r][c] for r in range(nrows) for c in range(ncols)])
     ):
         heatmap = attn_map[i].numpy().reshape(grid_dim, grid_dim)
-        ax.imshow(image, extent=[0, grid_dim, grid_dim, 0])
-        ax.imshow(heatmap, cmap="jet", interpolation="nearest", alpha=0.55,
-                  extent=[0, grid_dim, grid_dim, 0])
+        rgba = _make_rgba_heatmap(heatmap, image.size)
+        ax.imshow(image)
+        ax.imshow(rgba)
         ax.set_title(f'"{label}"', fontsize=9)
         ax.axis("off")
 
@@ -272,7 +290,7 @@ def _plot_head_averaged(attn_map, token_labels, grid_dim, image, image_path, arg
     base = os.path.splitext(os.path.basename(image_path))[0]
     query_slug = args.text_query.replace(" ", "_")
     head_slug = f"_head{head_idx}" if head_idx is not None else ""
-    out = os.path.join(args.output_dir, f"cross_attn_{base}_{query_slug}{head_slug}.png")
+    out = os.path.join(args.output_dir, f"{base}_{query_slug}{head_slug}.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {out}")
@@ -289,9 +307,9 @@ def _plot_per_head(attn_map, token_labels, grid_dim, image, image_path, args):
         for t in range(n_tokens):
             ax = axes[h][t]
             heatmap = attn_map[h, t].numpy().reshape(grid_dim, grid_dim)
-            ax.imshow(image, extent=[0, grid_dim, grid_dim, 0])
-            ax.imshow(heatmap, cmap="jet", interpolation="nearest", alpha=0.55,
-                      extent=[0, grid_dim, grid_dim, 0])
+            rgba = _make_rgba_heatmap(heatmap, image.size)
+            ax.imshow(image)
+            ax.imshow(rgba)
             ax.axis("off")
             if h == 0:
                 ax.set_title(f'"{token_labels[t]}"', fontsize=7)
@@ -346,7 +364,7 @@ def main():
     )
     parser.add_argument(
         # "--output_dir", type=str, default="attention_outputs/video_frames",
-        "--output_dir", type=str, default="attention_outputs/position_info",
+        "--output_dir", type=str, default="attention_outputs/position_info/cube/",
         help="Output directory",
     )
     args = parser.parse_args()

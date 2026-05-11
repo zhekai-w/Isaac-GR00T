@@ -351,6 +351,7 @@ def main(args: ArgsConfig):
     print("Sensors ready.")
 
     # --- Filters (one per joint, persistent across cycles) ---
+    dt = args.dt
     freq = 1.0 / args.dt
     if args.filter:
         arm_filters = [OneEuroFilter(freq, args.filter_mincutoff, args.filter_beta) for _ in range(6)]
@@ -401,10 +402,12 @@ def main(args: ArgsConfig):
             if returning_home:
                 if is_at_home(state):
                     print("Home pose reached, resuming normal operation...")
+                    args.dt = dt
                     returning_home = False
                 else:
                     arm_chunk = [HOME_JOINT_POSITIONS.copy()] * args.action_horizon
                     grip_chunk = [0.0] * args.action_horizon  # open gripper
+                    args.dt = 1.5
 
             if args.send_mode == "chunk":
                 for i, grip_pos in enumerate(grip_chunk):

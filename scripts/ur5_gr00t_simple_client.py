@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 from dataclasses import dataclass
@@ -14,7 +15,8 @@ from control_msgs.action import FollowJointTrajectory, GripperCommand
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from gr00t.eval.robot import RobotInferenceClient
-from eval_policy_hardware import OneEuroFilter
+from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk, blend_chunk_boundary
+from scipy.signal import savgol_filter
 
 # Azure Kinect
 import pyk4a
@@ -24,17 +26,18 @@ from pyk4a import Config, PyK4A
 import pyrealsense2 as rs
 
 WIDTH, HEIGHT = 640, 360
+WFOV_DEVICE = 6
 GRIPPER_THRESHOLD = 0.005  # metres (~5 mm dead-band)
 RELEASE_ENTER_THRESHOLD = 0.1
 RELEASE_EXIT_THRESHOLD = 0.05 
 
 HOME_JOINT_POSITIONS = np.array([
-    -1.749514404927389,  # shoulder_lift_joint
-     1.754384994506836,  # elbow_joint
-    -1.6118515173541468, # wrist_1_joint
-    -1.5746586958514612, # wrist_2_joint
-    -0.12216407457460576, # wrist_3_joint
      1.4191266298294067,  # shoulder_pan_joint
+    -1.749514404927389,   # shoulder_lift_joint
+     1.754384994506836,   # elbow_joint
+    -1.6118515173541468,  # wrist_1_joint
+    -1.5746586958514612,  # wrist_2_joint
+    -0.12216407457460576, # wrist_3_joint
 ])
 HOME_TOLERANCE = 0.05
 
@@ -55,21 +58,32 @@ class ArgsConfig:
     filter: bool = False
     filter_mincutoff: float = 1.0  # Hz — lower = more smoothing
     filter_beta: float = 0.1       # speed coefficient — higher = less lag when moving fast
+    # Within-chunk polynomial smoothing
+    chunk_filter: Literal["none", "savgol", "rts"] = "none"
+    chunk_filter_window: int = 7      # savgol: must be odd and < action_horizon
+    chunk_filter_polyorder: int = 3   # savgol: must be < chunk_filter_window
+    chunk_filter_q: float = 1e-3      # rts: process noise (larger = trust measurements more)
+    chunk_filter_r: float = 1e-4      # rts: measurement noise (larger = smooth more)
+    # Between-chunk boundary blending
+    boundary_blend: bool = False
+    boundary_blend_steps: int = 4     # cosine ramp over first N waypoints (N * dt seconds)
 
 
-def build_obs_dict(img1, img2, state, lang):
+def build_obs_dict(img1, img3, state, lang):
     """
     Build GR00T observation dict from raw sensor data.
 
     Args:
         img1: Azure Kinect RGB image, shape (360, 640, 3), uint8
         img2: RealSense RGB image, shape (360, 640, 3), uint8
+        img3: WFOV USB camera RGB image, shape (360, 640, 3), uint8
         state: Joint state, shape (7,), float64
-               [shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, shoulder_pan, gripper]
+               [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, gripper]
     """
     return {
         "video.azure_kinect": img1[np.newaxis, ...],
-        "video.realsense": img2[np.newaxis, ...],
+        # "video.realsense": img2[np.newaxis, ...],
+        "video.wfov": img3[np.newaxis, ...],
         "state.ur5_arm": state[:6][np.newaxis, ...].astype(np.float64),
         "state.gripper": state[6:7][np.newaxis, ...].astype(np.float64),
         "annotation.human.task_description": [lang],
@@ -135,9 +149,9 @@ class UR5SensorNode(Node):
         # --- Azure Kinect init ---
         k4a_config = Config()
         k4a_config.color_resolution = pyk4a.ColorResolution.RES_1080P
-        k4a_config.depth_mode = pyk4a.DepthMode.NFOV_UNBINNED
+        k4a_config.depth_mode = pyk4a.DepthMode.OFF
         k4a_config.camera_fps = pyk4a.FPS.FPS_30
-        k4a_config.synchronized_images_only = True
+        k4a_config.synchronized_images_only = False
         self.k4a = PyK4A(k4a_config)
         self.k4a.start()
 
@@ -154,8 +168,20 @@ class UR5SensorNode(Node):
         self.rs_lock = threading.Lock()
         self.camera_running = True
 
+        # --- WFOV USB camera init ---
+        self.wfov_cap = cv2.VideoCapture(WFOV_DEVICE)
+        self.wfov_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.wfov_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
+        self.wfov_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
+        if not self.wfov_cap.isOpened():
+            raise RuntimeError(f"Failed to open WFOV camera at /dev/video{WFOV_DEVICE}")
+
+        self.latest_wfov_image = None
+        self.wfov_lock = threading.Lock()
+
         threading.Thread(target=self._k4a_loop, daemon=True).start()
-        threading.Thread(target=self._rs_loop, daemon=True).start()
+        # threading.Thread(target=self._rs_loop, daemon=True).start()
+        threading.Thread(target=self._wfov_loop, daemon=True).start()
 
     # -- ROS2 callbacks --
     def _jointstate_callback(self, msg):
@@ -194,6 +220,32 @@ class UR5SensorNode(Node):
                 self.get_logger().error(f"RS error: {e}")
                 time.sleep(0.01)
 
+    def _wfov_loop(self):
+        while self.camera_running:
+            try:
+                ret, frame = self.wfov_cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+                h, w = frame.shape[:2]
+                target_ratio = WIDTH / HEIGHT
+                if w / h > target_ratio:
+                    crop_w = int(h * target_ratio)
+                    x = (w - crop_w) // 2
+                    frame = frame[:, x:x + crop_w]
+                else:
+                    crop_h = int(w / target_ratio)
+                    y = (h - crop_h) // 2
+                    frame = frame[y:y + crop_h, :]
+                frame = cv2.resize(frame, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                with self.wfov_lock:
+                    self.latest_wfov_image = frame
+            except Exception as e:
+                self.get_logger().error(f"WFOV error: {e}")
+                time.sleep(0.01)
+
     # -- Public getters --
     def get_azure_kinect_image(self):
         with self.k4a_lock:
@@ -202,6 +254,10 @@ class UR5SensorNode(Node):
     def get_realsense_image(self):
         with self.rs_lock:
             return self.latest_rs_image.copy() if self.latest_rs_image is not None else None
+
+    def get_wfov_image(self):
+        with self.wfov_lock:
+            return self.latest_wfov_image.copy() if self.latest_wfov_image is not None else None
 
     def get_joint_state(self):
         with self.joint_lock:
@@ -256,7 +312,7 @@ class UR5SensorNode(Node):
             return False
 
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = self.scaled_joint_names
+        goal.trajectory.joint_names = self.scaled_joint_names_reordered
         point = JointTrajectoryPoint()
         point.positions = np.atleast_1d(arm_positions).tolist()
         if velocities is not None:
@@ -298,7 +354,7 @@ class UR5SensorNode(Node):
     def send_chunk_action(self, arm_actions, dt):
         """Send full action chunk as one trajectory goal; controller spline-interpolates."""
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = self.joint_names
+        goal.trajectory.joint_names = self.scaled_joint_names_reordered
         for i, positions in enumerate(arm_actions):
             point = JointTrajectoryPoint()
             point.positions = np.atleast_1d(positions).tolist()
@@ -331,6 +387,85 @@ class UR5SensorNode(Node):
         self.camera_running = False
         self.k4a.stop()
         self.rs_pipeline.stop()
+        self.wfov_cap.release()
+
+
+def savgol_chunk(arm_chunk: np.ndarray, window_length: int = 7, polyorder: int = 3) -> np.ndarray:
+    """Savitzky-Golay smooth over time axis of arm trajectory chunk (H, 6)."""
+    return savgol_filter(arm_chunk, window_length, polyorder, axis=0)
+
+
+def rts_smoother_chunk(arm_chunk: np.ndarray, dt: float = 0.15,
+                        q: float = 1e-3, r: float = 1e-4) -> np.ndarray:
+    """RTS (Rauch-Tung-Striebel) Kalman smoother on arm trajectory chunk.
+
+    Constant-velocity state model per joint: state = [position, velocity].
+    q: process noise — larger = more responsive, less smooth.
+    r: measurement noise — larger = more smoothing.
+    arm_chunk: (H, N) — works for any number of joints N.
+    Returns (H, N) smoothed positions.
+    """
+    H, n_joints = arm_chunk.shape
+    F = np.array([[1.0, dt], [0.0, 1.0]])
+    Hm = np.array([[1.0, 0.0]])
+    Q = q * np.array([[dt**3 / 3, dt**2 / 2], [dt**2 / 2, dt]])
+    R = np.array([[r]])
+
+    smoothed = np.zeros_like(arm_chunk)
+    for j in range(n_joints):
+        z = arm_chunk[:, j]
+        # Forward Kalman pass
+        xs = np.zeros((H, 2))
+        Ps = np.zeros((H, 2, 2))
+        x = np.array([z[0], 0.0])
+        P = np.eye(2)
+        for t in range(H):
+            x = F @ x
+            P = F @ P @ F.T + Q
+            S = (Hm @ P @ Hm.T + R)[0, 0]
+            K = (P @ Hm.T) / S
+            x = x + K.flatten() * (z[t] - (Hm @ x)[0])
+            P = (np.eye(2) - K @ Hm) @ P
+            xs[t], Ps[t] = x, P
+        # Backward RTS smoother pass
+        sm = xs.copy()
+        Psm = Ps.copy()
+        for t in range(H - 2, -1, -1):
+            P_pred = F @ Ps[t] @ F.T + Q
+            G = Ps[t] @ F.T @ np.linalg.inv(P_pred)
+            sm[t] = xs[t] + G @ (sm[t + 1] - F @ xs[t])
+            Psm[t] = Ps[t] + G @ (Psm[t + 1] - P_pred) @ G.T
+        smoothed[:, j] = sm[:, 0]
+    return smoothed
+
+
+def blend_chunk_boundary(arm_chunk: np.ndarray, prev_end_pos: np.ndarray,
+                          prev_end_vel: np.ndarray, dt: float,
+                          blend_steps: int = 4) -> np.ndarray:
+    """Cosine-ramp first blend_steps waypoints from previous chunk's terminal state.
+
+    Eliminates hard positional jumps at chunk boundaries.
+    prev_end_pos: (N,) last commanded position of previous chunk.
+    prev_end_vel: (N,) estimated velocity at end of previous chunk (units/s).
+    """
+    blended = arm_chunk.copy()
+    n = min(blend_steps, arm_chunk.shape[0])
+    for step in range(n):
+        alpha = 0.5 * (1.0 - np.cos(np.pi * (step + 1) / n))  # 0 → 1
+        predicted = prev_end_pos + prev_end_vel * dt * (step + 1)
+        blended[step] = (1.0 - alpha) * predicted + alpha * arm_chunk[step]
+    return blended
+
+
+def send_gripper_paced(sensor, grip_chunk: list, dt: float, effort: float) -> None:
+    """Send gripper commands synchronized with arm waypoint timing."""
+    prev = grip_chunk[0]
+    sensor.send_gripper_command(prev, max_effort=effort)
+    for g in grip_chunk[1:]:
+        time.sleep(dt)
+        if abs(g - prev) > GRIPPER_THRESHOLD:
+            sensor.send_gripper_command(g, max_effort=effort)
+            prev = g
 
 
 def main(args: ArgsConfig):
@@ -346,9 +481,23 @@ def main(args: ArgsConfig):
 
     # Wait for first readings
     print("Waiting for sensor data...")
-    while sensor.get_joint_state() is None or sensor.get_azure_kinect_image() is None or sensor.get_realsense_image() is None:
+    while sensor.get_joint_state() is None or sensor.get_azure_kinect_image() is None \
+            is None or sensor.get_wfov_image() is None:
         time.sleep(0.1)
     print("Sensors ready.")
+
+    print("Moving to home position before inference...")
+    sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
+    sensor.send_gripper_command(0.0, max_effort=args.gripper_max_effort)
+    print("Home position reached.")
+
+    # Validate chunk filter args
+    if args.chunk_filter == "savgol":
+        assert args.chunk_filter_window % 2 == 1, "chunk_filter_window must be odd"
+        assert args.chunk_filter_window < args.action_horizon, \
+            f"chunk_filter_window ({args.chunk_filter_window}) must be < action_horizon ({args.action_horizon})"
+        assert args.chunk_filter_polyorder < args.chunk_filter_window, \
+            "chunk_filter_polyorder must be < chunk_filter_window"
 
     # --- Filters (one per joint, persistent across cycles) ---
     dt = args.dt
@@ -368,18 +517,27 @@ def main(args: ArgsConfig):
 
     prev_gripper = 0.0
     returning_home = False
+    prev_chunk_end_pos: np.ndarray | None = None  # (6,) last commanded arm position
+    prev_chunk_end_vel: np.ndarray | None = None  # (6,) estimated velocity at end of chunk
+
+    os.makedirs("inference_images", exist_ok=True)
 
     # --- Control loop ---
     try:
         for cycle in range(args.num_cycles):
-            time.sleep(0.5)
+            time.sleep(0.3)
             img1 = sensor.get_azure_kinect_image()
-            img2 = sensor.get_realsense_image()
+            # img2 = sensor.get_realsense_image()
+            img3 = sensor.get_wfov_image()
             state = sensor.get_joint_state()
 
-            # state_reordered = state[[5, 0, 1, 2, 3, 4, 6]]
-            # obs = build_obs_dict(img1, img2, state_reordered, args.lang)
-            obs = build_obs_dict(img1, img2, state, args.lang)
+            if img1 is not None:
+                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_k4a.jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
+            if img3 is not None:
+                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img3, cv2.COLOR_RGB2BGR))
+
+            state_reordered = state[[5, 0, 1, 2, 3, 4, 6]]
+            obs = build_obs_dict(img1, img3, state_reordered, args.lang)
 
             t0 = time.perf_counter()
             action_dict = client.get_action(obs)
@@ -399,38 +557,64 @@ def main(args: ArgsConfig):
                 arm_chunk.append(arm_pos)
                 grip_chunk.append(grip_pos)
 
+            # --- Within-chunk smoothing ---
+            arm_chunk_arr = np.array(arm_chunk)    # (H, 6)
+            grip_chunk_arr = np.array(grip_chunk)  # (H,)
+
+            if args.chunk_filter == "savgol":
+                arm_chunk_arr = savgol_chunk(arm_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
+                grip_chunk_arr = savgol_filter(grip_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
+            elif args.chunk_filter == "rts":
+                arm_chunk_arr = rts_smoother_chunk(arm_chunk_arr, dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r)
+                grip_chunk_arr = rts_smoother_chunk(grip_chunk_arr[:, np.newaxis], dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r).squeeze(1)
+
+            arm_chunk = arm_chunk_arr
+            grip_chunk = grip_chunk_arr.tolist()
+
+            if cycle > 26:
+                returning_home = True
+
             if returning_home:
-                if is_at_home(state):
+                if is_at_home(state_reordered):
                     print("Home pose reached, resuming normal operation...")
                     args.dt = dt
                     returning_home = False
                 else:
                     arm_chunk = [HOME_JOINT_POSITIONS.copy()] * args.action_horizon
                     grip_chunk = [0.0] * args.action_horizon  # open gripper
-                    args.dt = 1.5
+                    args.dt = 2.0
+
+            # --- Boundary blending + state update (skip when overriding to home) ---
+            if not returning_home:
+                arm_arr = np.array(arm_chunk)
+                if args.boundary_blend and prev_chunk_end_pos is not None:
+                    arm_arr = blend_chunk_boundary(arm_arr, prev_chunk_end_pos, prev_chunk_end_vel, args.dt, args.boundary_blend_steps)
+                    arm_chunk = arm_arr
+                prev_chunk_end_pos = arm_arr[-1].copy()
+                prev_chunk_end_vel = (arm_arr[-1] - arm_arr[-2]) / args.dt
 
             if args.send_mode == "chunk":
-                for i, grip_pos in enumerate(grip_chunk):
-                    was_holding = prev_gripper > RELEASE_ENTER_THRESHOLD
-                    is_holding = grip_pos > RELEASE_ENTER_THRESHOLD
-                    if was_holding and not is_holding:
-                        on_object_released(cycle, step=i, gripper_value=grip_pos)
-                    prev_gripper = grip_pos
-                    sensor.send_gripper_command(grip_pos, max_effort=args.gripper_max_effort)
+                grip_thread = threading.Thread(
+                    target=send_gripper_paced,
+                    args=(sensor, grip_chunk, args.dt, args.gripper_max_effort),
+                    daemon=True,
+                )
+                grip_thread.start()
                 sensor.send_chunk_action(arm_chunk, args.dt)
+                grip_thread.join()
 
             elif args.send_mode == "single":
-                CHUNK_SIZE = 16
-                WAIT_FROM = 14  # frame index within chunk where wait flips to True
+                CHUNK_SIZE = args.action_horizon
+                WAIT_FROM = CHUNK_SIZE - 2  # frame index within chunk where wait flips to True
                 last_grip_sent = grip_chunk[0] - 2 * GRIPPER_THRESHOLD
                 for i, (arm_pos, grip_pos) in enumerate(zip(arm_chunk, grip_chunk)):
                     pos_in_chunk = i % CHUNK_SIZE
                     is_last_in_chunk = (pos_in_chunk >= WAIT_FROM) or (i == len(arm_chunk) - 1)
-                    was_holding = prev_gripper > RELEASE_ENTER_THRESHOLD
-                    is_holding = grip_pos > RELEASE_ENTER_THRESHOLD
-                    if was_holding and not is_holding:
-                        on_object_released(cycle, step=i, gripper_value=grip_pos)
-                    prev_gripper = grip_pos
+                    # was_holding = prev_gripper > RELEASE_ENTER_THRESHOLD
+                    # is_holding = grip_pos > RELEASE_ENTER_THRESHOLD
+                    # if was_holding and not is_holding:
+                    #     on_object_released(cycle, step=i, gripper_value=grip_pos)
+                    # prev_gripper = grip_pos
                     if abs(grip_pos - last_grip_sent) > GRIPPER_THRESHOLD:
                         sensor.send_gripper_command(grip_pos, max_effort=args.gripper_max_effort)
                         last_grip_sent = grip_pos

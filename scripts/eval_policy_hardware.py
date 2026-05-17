@@ -33,6 +33,7 @@ from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient
 from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import BasePolicy, Gr00tPolicy
+from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk, blend_chunk_boundary
 
 
 @dataclass
@@ -59,39 +60,15 @@ class ArgsConfig:
     filter_mincutoff: float = 1.0  # Hz — lower = more smoothing
     filter_beta: float = 0.1       # speed coefficient — higher = less lag when moving fast
     send_mode: Literal["single", "chunk"] = "chunk"
-
-
-class OneEuroFilter:
-    """Adaptive low-pass filter that reduces lag at high speeds.
-
-    At rest: heavy smoothing (cutoff = mincutoff).
-    Moving fast: light smoothing (cutoff grows with speed via beta).
-    """
-
-    def __init__(self, freq: float, mincutoff: float = 1.0, beta: float = 0.0, dcutoff: float = 1.0):
-        self.freq = freq
-        self.mincutoff = mincutoff
-        self.beta = beta
-        self.dcutoff = dcutoff
-        self._x = None
-        self._dx = 0.0
-
-    @staticmethod
-    def _alpha(cutoff: float, freq: float) -> float:
-        tau = 1.0 / (2 * np.pi * cutoff)
-        return 1.0 / (1.0 + tau * freq)
-
-    def __call__(self, x: float) -> float:
-        if self._x is None:
-            self._x = x
-            return x
-        dx = (x - self._x) * self.freq
-        a_d = self._alpha(self.dcutoff, self.freq)
-        self._dx = a_d * dx + (1 - a_d) * self._dx
-        cutoff = self.mincutoff + self.beta * abs(self._dx)
-        a = self._alpha(cutoff, self.freq)
-        self._x = a * x + (1 - a) * self._x
-        return self._x
+    # Within-chunk polynomial smoothing
+    chunk_filter: Literal["none", "savgol", "rts"] = "none"
+    chunk_filter_window: int = 7      # savgol: must be odd and < action_horizon
+    chunk_filter_polyorder: int = 3   # savgol: must be < chunk_filter_window
+    chunk_filter_q: float = 1e-3      # rts: process noise (larger = trust measurements more)
+    chunk_filter_r: float = 1e-4      # rts: measurement noise (larger = smooth more)
+    # Between-chunk boundary blending
+    boundary_blend: bool = False
+    boundary_blend_steps: int = 4     # cosine ramp over first N waypoints (N * dt seconds)
 
 
 class UR5HardwareNode(Node):

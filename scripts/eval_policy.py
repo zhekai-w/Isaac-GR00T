@@ -24,7 +24,7 @@ import numpy as np
 import tyro
 
 sys.path.insert(0, os.path.dirname(__file__))
-from eval_policy_hardware import OneEuroFilter
+from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk, blend_chunk_boundary
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
@@ -113,6 +113,27 @@ class ArgsConfig:
     dt: float = 0.05
     """Time step between actions (seconds), used to set filter frequency."""
 
+    chunk_filter: Literal["none", "savgol", "rts"] = "none"
+    """Within-chunk smoothing method applied to the full (H, D) action chunk."""
+
+    chunk_filter_window: int = 7
+    """Savitzky-Golay window length (must be odd and < action_horizon)."""
+
+    chunk_filter_polyorder: int = 3
+    """Savitzky-Golay polynomial order (must be < chunk_filter_window)."""
+
+    chunk_filter_q: float = 1e-3
+    """RTS process noise — larger = more responsive, less smooth."""
+
+    chunk_filter_r: float = 1e-4
+    """RTS measurement noise — larger = more smoothing."""
+
+    boundary_blend: bool = False
+    """Cosine-ramp first boundary_blend_steps waypoints from previous chunk end."""
+
+    boundary_blend_steps: int = 4
+    """Number of waypoints to blend at chunk boundaries (N * dt seconds)."""
+
 
 def main(args: ArgsConfig):
     data_config = load_data_config(args.data_config)
@@ -172,6 +193,13 @@ def main(args: ArgsConfig):
     print("All trajectories:", dataset.trajectory_lengths)
     print("Running on all trajs with modality keys:", args.modality_keys)
 
+    if args.chunk_filter == "savgol":
+        assert args.chunk_filter_window % 2 == 1, "chunk_filter_window must be odd"
+        assert args.chunk_filter_window < args.action_horizon, \
+            f"chunk_filter_window ({args.chunk_filter_window}) must be < action_horizon ({args.action_horizon})"
+        assert args.chunk_filter_polyorder < args.chunk_filter_window, \
+            "chunk_filter_polyorder must be < chunk_filter_window"
+
     all_mse = []
     all_inference_times = []
     total_start = time.perf_counter()
@@ -205,6 +233,29 @@ def main(args: ArgsConfig):
             freq = 1.0 / args.dt
             filters = [OneEuroFilter(freq, args.filter_mincutoff, args.filter_beta) for _ in range(action_dim)]
 
+        # Build chunk filter closure (carries boundary-blend state between chunks)
+        chunk_filter_fn = None
+        if args.chunk_filter != "none" or args.boundary_blend:
+            prev_state = {"end_pos": None, "end_vel": None}
+
+            def _make_chunk_filter(prev_state):
+                def chunk_filter_fn(chunk):
+                    # Within-chunk smoothing
+                    if args.chunk_filter == "savgol":
+                        chunk = savgol_chunk(chunk, args.chunk_filter_window, args.chunk_filter_polyorder)
+                    elif args.chunk_filter == "rts":
+                        chunk = rts_smoother_chunk(chunk, dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r)
+                    # Boundary blending
+                    if args.boundary_blend and prev_state["end_pos"] is not None:
+                        chunk = blend_chunk_boundary(chunk, prev_state["end_pos"], prev_state["end_vel"], args.dt, args.boundary_blend_steps)
+                    # Update state for next chunk
+                    prev_state["end_pos"] = chunk[-1].copy()
+                    prev_state["end_vel"] = (chunk[-1] - chunk[-2]) / args.dt
+                    return chunk
+                return chunk_filter_fn
+
+            chunk_filter_fn = _make_chunk_filter(prev_state)
+
         # Run the full eval (with MSE + plotting)
         mse = calc_mse_for_single_trajectory(
             policy,
@@ -217,6 +268,7 @@ def main(args: ArgsConfig):
             plot_state=args.plot_state,
             save_plot_path=args.save_plot_path,
             filters=filters,
+            chunk_filter_fn=chunk_filter_fn,
         )
         print("MSE:", mse)
         all_mse.append(mse)

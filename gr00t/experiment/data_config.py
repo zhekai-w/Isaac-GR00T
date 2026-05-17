@@ -775,8 +775,9 @@ class AgibotGenie1DataConfig(BaseDataConfig):
 
 class UR52F85DataConfig(BaseDataConfig):
     video_keys = [
-        "video.azure_kinect",
-        "video.realsense"
+        # "video.azure_kinect",
+        # "video.realsense",
+        "video.wfov",
         ]
     state_keys = ["state.ur5_arm", "state.gripper"]
     action_keys = ["action.ur5_arm", "action.gripper"]

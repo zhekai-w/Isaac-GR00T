@@ -44,12 +44,14 @@ def calc_mse_for_single_trajectory(
     plot=False,
     plot_state=False,
     save_plot_path=None,
-    filters=None,  # list of callables, one per action dim, or None
+    filters=None,       # list of callables, one per action dim (OneEuroFilter)
+    chunk_filter_fn=None,  # callable: (H, D) ndarray -> (H, D) ndarray, may carry internal state
 ):
     state_joints_across_time = []
     gt_action_across_time = []
     pred_action_across_time = []
     filtered_action_across_time = []
+    chunk_filtered_action_across_time = []
 
     for step_count in range(steps):
         data_point = None
@@ -66,18 +68,30 @@ def calc_mse_for_single_trajectory(
 
             print("inferencing at step: ", step_count)
             action_chunk = policy.get_action(data_point)
-            for j in range(action_horizon):
-                # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
-                # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
-                concat_pred_action = np.concatenate(
+
+            # Build full chunk array (H, D) for chunk-level filtering
+            raw_chunk = np.stack([
+                np.concatenate(
                     [np.atleast_1d(action_chunk[f"action.{key}"][j]) for key in modality_keys],
                     axis=0,
                 )
+                for j in range(action_horizon)
+            ])  # (H, D)
+
+            filtered_chunk = chunk_filter_fn(raw_chunk) if chunk_filter_fn is not None else None
+
+            for j in range(action_horizon):
+                # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
+                # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+                concat_pred_action = raw_chunk[j]
                 pred_action_across_time.append(concat_pred_action)
 
                 if filters is not None:
                     filtered = np.array([filters[k](concat_pred_action[k]) for k in range(len(filters))])
                     filtered_action_across_time.append(filtered)
+
+                if filtered_chunk is not None:
+                    chunk_filtered_action_across_time.append(filtered_chunk[j])
 
                 concat_gt_action = np.concatenate(
                     [data_point[f"action.{key}"][j] for key in modality_keys], axis=0
@@ -92,6 +106,9 @@ def calc_mse_for_single_trajectory(
 
     filtered_action_across_time = (
         np.array(filtered_action_across_time)[:steps] if filtered_action_across_time else None
+    )
+    chunk_filtered_action_across_time = (
+        np.array(chunk_filtered_action_across_time)[:steps] if chunk_filtered_action_across_time else None
     )
 
     # calc MSE across time
@@ -115,6 +132,7 @@ def calc_mse_for_single_trajectory(
             "gt_action_across_time": gt_action_across_time,
             "pred_action_across_time": pred_action_across_time,
             "filtered_action_across_time": filtered_action_across_time,
+            "chunk_filtered_action_across_time": chunk_filtered_action_across_time,
             "modality_keys": modality_keys,
             "traj_id": traj_id,
             "mse": mse,
@@ -142,6 +160,7 @@ def plot_trajectory(
     gt_action_across_time = info["gt_action_across_time"]
     pred_action_across_time = info["pred_action_across_time"]
     filtered_action_across_time = info.get("filtered_action_across_time")
+    chunk_filtered_action_across_time = info.get("chunk_filtered_action_across_time")
     modality_keys = info["modality_keys"]
     traj_id = info["traj_id"]
     mse = info["mse"]
@@ -174,7 +193,9 @@ def plot_trajectory(
         ax.plot(gt_action_across_time[:, i], label="gt action", linewidth=2)
         ax.plot(pred_action_across_time[:, i], label="pred action", linewidth=2, alpha=0.5)
         if filtered_action_across_time is not None:
-            ax.plot(filtered_action_across_time[:, i], label="filtered action", linewidth=2)
+            ax.plot(filtered_action_across_time[:, i], label="filtered action (1€)", linewidth=2)
+        if chunk_filtered_action_across_time is not None:
+            ax.plot(chunk_filtered_action_across_time[:, i], label="chunk filtered action", linewidth=2, linestyle="--")
 
         # put a dot every ACTION_HORIZON
         for j in range(0, steps, action_horizon):

@@ -208,7 +208,11 @@ def plot_trajectory(
         ax.legend(loc="upper right", framealpha=0.9)
         ax.grid(True, alpha=0.3)
 
-        # Set better axis labels
+        y_min, y_max = ax.get_ylim()
+        y_center = (y_min + y_max) / 2
+        if (y_max - y_min) < 0.2:
+            ax.set_ylim(y_center - 0.1, y_center + 0.1)
+
         ax.set_xlabel("Time Step", fontsize=10)
         ax.set_ylabel("Value", fontsize=10)
 

@@ -1,6 +1,8 @@
 import os
+import subprocess
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
@@ -14,6 +16,7 @@ from sensor_msgs.msg import JointState
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
+from std_msgs.msg import Float64MultiArray
 from gr00t.eval.robot import RobotInferenceClient
 from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk, blend_chunk_boundary
 from scipy.signal import savgol_filter
@@ -26,19 +29,54 @@ from pyk4a import Config, PyK4A
 import pyrealsense2 as rs
 
 WIDTH, HEIGHT = 640, 360
-WFOV_DEVICE = 6
+WFOV_DEVICE = 0
+WFOV_DEVICE_PATH = f"/dev/video{WFOV_DEVICE}"
+
+_WFOV_V4L2_DEFAULTS = [
+    ("brightness",                 0),
+    ("contrast",                  32),
+    ("saturation",                64),
+    ("hue",                        0),
+    ("white_balance_automatic",    1),
+    ("gamma",                    100),
+    ("gain",                       0),
+    ("power_line_frequency",       1),
+    ("white_balance_temperature", 4600),
+    ("sharpness",                  2),
+    ("backlight_compensation",     1),
+    ("auto_exposure",              3),
+    ("exposure_time_absolute",   157),
+    ("exposure_dynamic_framerate", 0),
+]
+
+def _wfov_init_camera():
+    for name, value in _WFOV_V4L2_DEFAULTS:
+        subprocess.run(
+            ["v4l2-ctl", "-d", WFOV_DEVICE_PATH, "-c", f"{name}={value}"],
+            capture_output=True,
+        )
 GRIPPER_THRESHOLD = 0.005  # metres (~5 mm dead-band)
 RELEASE_ENTER_THRESHOLD = 0.1
-RELEASE_EXIT_THRESHOLD = 0.05 
+RELEASE_EXIT_THRESHOLD = 0.05
+
+# HOME_JOINT_POSITIONS = np.array([
+#      1.4191266298294067,  # shoulder_pan_joint
+#     -1.749514404927389,   # shoulder_lift_joint
+#      1.754384994506836,   # elbow_joint
+#     -1.6118515173541468,  # wrist_1_joint
+#     -1.5746586958514612,  # wrist_2_joint
+#     -0.12216407457460576, # wrist_3_joint
+# ])
 
 HOME_JOINT_POSITIONS = np.array([
-     1.4191266298294067,  # shoulder_pan_joint
-    -1.749514404927389,   # shoulder_lift_joint
-     1.754384994506836,   # elbow_joint
-    -1.6118515173541468,  # wrist_1_joint
-    -1.5746586958514612,  # wrist_2_joint
-    -0.12216407457460576, # wrist_3_joint
+     np.deg2rad(90.0),  # shoulder_pan_joint
+     np.deg2rad(-89.71),   # shoulder_lift_joint
+     np.deg2rad(96.66),   # elbow_joint
+     np.deg2rad(-96.91),  # wrist_1_joint
+     np.deg2rad(-89.70),  # wrist_2_joint
+     np.deg2rad(0.0), # wrist_3_joint
 ])
+
 HOME_TOLERANCE = 0.05
 
 
@@ -67,23 +105,28 @@ class ArgsConfig:
     # Between-chunk boundary blending
     boundary_blend: bool = False
     boundary_blend_steps: int = 4     # cosine ramp over first N waypoints (N * dt seconds)
+    # Frame buffer selection: 0 = current frame, -N = N frames ago (range [-4, 0])
+    buffer: int = 0
+    # Controller for chunk mode: "scaled_joint_trajectory_controller" uses action server,
+    # "forward_position_controller" publishes Float64MultiArray directly (no interpolation)
+    controller: Literal["scaled_joint_trajectory_controller", "forward_position_controller"] = "scaled_joint_trajectory_controller"
 
 
-def build_obs_dict(img1, img3, state, lang):
+def build_obs_dict(img1, img2, state, lang):
     """
     Build GR00T observation dict from raw sensor data.
 
     Args:
         img1: Azure Kinect RGB image, shape (360, 640, 3), uint8
         img2: RealSense RGB image, shape (360, 640, 3), uint8
-        img3: WFOV USB camera RGB image, shape (360, 640, 3), uint8
+        img2: WFOV USB camera RGB image, shape (360, 640, 3), uint8
         state: Joint state, shape (7,), float64
                [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, gripper]
     """
     return {
         "video.azure_kinect": img1[np.newaxis, ...],
         # "video.realsense": img2[np.newaxis, ...],
-        "video.wfov": img3[np.newaxis, ...],
+        "video.wfov": img2[np.newaxis, ...],
         "state.ur5_arm": state[:6][np.newaxis, ...].astype(np.float64),
         "state.gripper": state[6:7][np.newaxis, ...].astype(np.float64),
         "annotation.human.task_description": [lang],
@@ -91,8 +134,9 @@ def build_obs_dict(img1, img3, state, lang):
 
 
 class UR5SensorNode(Node):
-    def __init__(self):
+    def __init__(self, controller: str = "scaled_joint_trajectory_controller"):
         super().__init__('ur5_gr00t_client')
+        self._controller = controller
 
         # --- Joint state buffers ---
         self.latest_joint_position = None
@@ -110,6 +154,15 @@ class UR5SensorNode(Node):
             FollowJointTrajectory,
             "/scaled_joint_trajectory_controller/follow_joint_trajectory",
         )
+        # Publisher for forward_position_controller (chunk mode only)
+        if controller == "forward_position_controller":
+            self._fpc_pub = self.create_publisher(
+                Float64MultiArray,
+                "/forward_position_controller/commands",
+                1,
+            )
+        else:
+            self._fpc_pub = None
         # Action client: Robotiq gripper
         self._gripper_action = ActionClient(
             self,
@@ -156,19 +209,24 @@ class UR5SensorNode(Node):
         self.k4a.start()
 
         # --- RealSense init ---
-        self.rs_pipeline = rs.pipeline()
-        rs_config = rs.config()
-        rs_config.enable_stream(rs.stream.color, WIDTH, HEIGHT, rs.format.rgb8, 30)
-        self.rs_pipeline.start(rs_config)
+        # self.rs_pipeline = rs.pipeline()
+        # rs_config = rs.config()
+        # rs_config.enable_stream(rs.stream.color, WIDTH, HEIGHT, rs.format.rgb8, 30)
+        # self.rs_pipeline.start(rs_config)
 
         # --- Camera buffers + threads ---
-        self.latest_k4a_image = None
+        self.k4a_buffer = deque(maxlen=5)  # newest at right; img1 (Azure Kinect)
         self.k4a_lock = threading.Lock()
-        self.latest_rs_image = None
-        self.rs_lock = threading.Lock()
+        # self.latest_rs_image = None
+        # self.rs_lock = threading.Lock()
         self.camera_running = True
+        self._k4a_frame_count = 0
+        self._k4a_fps_t0 = None
+        self._wfov_frame_count = 0
+        self._wfov_fps_t0 = None
 
         # --- WFOV USB camera init ---
+        _wfov_init_camera()
         self.wfov_cap = cv2.VideoCapture(WFOV_DEVICE)
         self.wfov_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.wfov_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
@@ -176,7 +234,7 @@ class UR5SensorNode(Node):
         if not self.wfov_cap.isOpened():
             raise RuntimeError(f"Failed to open WFOV camera at /dev/video{WFOV_DEVICE}")
 
-        self.latest_wfov_image = None
+        self.wfov_buffer = deque(maxlen=5)  # newest at right; img2 (WFOV)
         self.wfov_lock = threading.Lock()
 
         threading.Thread(target=self._k4a_loop, daemon=True).start()
@@ -202,23 +260,30 @@ class UR5SensorNode(Node):
                 rgb = capture.color[:, :, 2::-1]
                 rgb = cv2.resize(rgb, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
                 with self.k4a_lock:
-                    self.latest_k4a_image = np.array(rgb, dtype=np.uint8)
+                    self.k4a_buffer.append(np.array(rgb, dtype=np.uint8))
+                self._k4a_frame_count += 1
+                now = time.perf_counter()
+                if self._k4a_fps_t0 is None:
+                    self._k4a_fps_t0 = now
+                elif self._k4a_frame_count % 150 == 0:
+                    fps = self._k4a_frame_count / (now - self._k4a_fps_t0)
+                    print(f"[camera_fps] azure_kinect: {fps:.1f} Hz")
             except Exception as e:
                 self.get_logger().error(f"K4A error: {e}")
                 time.sleep(0.01)
 
-    def _rs_loop(self):
-        while self.camera_running:
-            try:
-                frames = self.rs_pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
-                if not color_frame:
-                    continue
-                with self.rs_lock:
-                    self.latest_rs_image = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
-            except RuntimeError as e:
-                self.get_logger().error(f"RS error: {e}")
-                time.sleep(0.01)
+    # def _rs_loop(self):
+    #     while self.camera_running:
+    #         try:
+    #             frames = self.rs_pipeline.wait_for_frames()
+    #             color_frame = frames.get_color_frame()
+    #             if not color_frame:
+    #                 continue
+    #             with self.rs_lock:
+    #                 self.latest_rs_image = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
+    #         except RuntimeError as e:
+    #             self.get_logger().error(f"RS error: {e}")
+    #             time.sleep(0.01)
 
     def _wfov_loop(self):
         while self.camera_running:
@@ -239,25 +304,40 @@ class UR5SensorNode(Node):
                     frame = frame[y:y + crop_h, :]
                 frame = cv2.resize(frame, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
+
                 with self.wfov_lock:
-                    self.latest_wfov_image = frame
+                    self.wfov_buffer.append(frame)
+                self._wfov_frame_count += 1
+                now = time.perf_counter()
+                if self._wfov_fps_t0 is None:
+                    self._wfov_fps_t0 = now
+                elif self._wfov_frame_count % 150 == 0:
+                    fps = self._wfov_frame_count / (now - self._wfov_fps_t0)
+                    print(f"[camera_fps] wfov:         {fps:.1f} Hz")
             except Exception as e:
                 self.get_logger().error(f"WFOV error: {e}")
                 time.sleep(0.01)
 
     # -- Public getters --
-    def get_azure_kinect_image(self):
+    def get_azure_kinect_image(self, buffer_idx: int = 0):
+        """Return frame from k4a ring buffer. buffer_idx=0 → newest, -N → N frames ago."""
         with self.k4a_lock:
-            return self.latest_k4a_image.copy() if self.latest_k4a_image is not None else None
+            if len(self.k4a_buffer) == 0:
+                return None
+            idx = max(-(len(self.k4a_buffer)), buffer_idx - 1)
+            return self.k4a_buffer[idx].copy()
 
     def get_realsense_image(self):
         with self.rs_lock:
             return self.latest_rs_image.copy() if self.latest_rs_image is not None else None
 
-    def get_wfov_image(self):
+    def get_wfov_image(self, buffer_idx: int = 0):
+        """Return frame from WFOV ring buffer. buffer_idx=0 → newest, -N → N frames ago."""
         with self.wfov_lock:
-            return self.latest_wfov_image.copy() if self.latest_wfov_image is not None else None
+            if len(self.wfov_buffer) == 0:
+                return None
+            idx = max(-(len(self.wfov_buffer)), buffer_idx - 1)
+            return self.wfov_buffer[idx].copy()
 
     def get_joint_state(self):
         with self.joint_lock:
@@ -350,7 +430,7 @@ class UR5SensorNode(Node):
                 f"error_string={result.error_string}"
             )
             return False
-        
+
     def send_chunk_action(self, arm_actions, dt):
         """Send full action chunk as one trajectory goal; controller spline-interpolates."""
         goal = FollowJointTrajectory.Goal()
@@ -376,6 +456,14 @@ class UR5SensorNode(Node):
         while not result_future.done():
             time.sleep(0.01)
 
+    def send_chunk_action_fpc(self, arm_actions, dt):
+        """Send chunk waypoints to forward_position_controller at fixed dt intervals."""
+        for positions in arm_actions:
+            msg = Float64MultiArray()
+            msg.data = np.atleast_1d(positions).tolist()
+            self._fpc_pub.publish(msg)
+            time.sleep(dt)
+
     def send_gripper_command(self, position, max_effort=50.0):
         """Send a gripper position command (fire-and-forget)."""
         goal = GripperCommand.Goal()
@@ -386,7 +474,7 @@ class UR5SensorNode(Node):
     def stop(self):
         self.camera_running = False
         self.k4a.stop()
-        self.rs_pipeline.stop()
+        # self.rs_pipeline.stop()
         self.wfov_cap.release()
 
 
@@ -469,20 +557,24 @@ def send_gripper_paced(sensor, grip_chunk: list, dt: float, effort: float) -> No
 
 
 def main(args: ArgsConfig):
+    assert -4 <= args.buffer <= 0, f"--buffer must be in [-4, 0], got {args.buffer}"
+
     client = RobotInferenceClient(host=args.host, port=args.port)
     assert client.ping(), "Server not reachable"
     print("Modality config:", client.get_modality_config())
 
     # --- Init ROS2 + sensor node ---
     rclpy.init()
-    sensor = UR5SensorNode()
+    sensor = UR5SensorNode(controller=args.controller)
     spin_thread = threading.Thread(target=rclpy.spin, args=(sensor,), daemon=True)
     spin_thread.start()
 
     # Wait for first readings
-    print("Waiting for sensor data...")
-    while sensor.get_joint_state() is None or sensor.get_azure_kinect_image() is None \
-            is None or sensor.get_wfov_image() is None:
+    need_frames = abs(args.buffer) + 1
+    print(f"Waiting for sensor data (need {need_frames} buffered frame(s))...")
+    while (sensor.get_joint_state() is None
+           or len(sensor.k4a_buffer) < need_frames
+           or len(sensor.wfov_buffer) < need_frames):
         time.sleep(0.1)
     print("Sensors ready.")
 
@@ -526,18 +618,18 @@ def main(args: ArgsConfig):
     try:
         for cycle in range(args.num_cycles):
             time.sleep(0.3)
-            img1 = sensor.get_azure_kinect_image()
+            img1 = sensor.get_azure_kinect_image(args.buffer)
             # img2 = sensor.get_realsense_image()
-            img3 = sensor.get_wfov_image()
+            img2 = sensor.get_wfov_image(args.buffer)
             state = sensor.get_joint_state()
 
             if img1 is not None:
                 cv2.imwrite(f"inference_images/cycle_{cycle:04d}_k4a.jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
-            if img3 is not None:
-                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img3, cv2.COLOR_RGB2BGR))
+            if img2 is not None:
+                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
 
             state_reordered = state[[5, 0, 1, 2, 3, 4, 6]]
-            obs = build_obs_dict(img1, img3, state_reordered, args.lang)
+            obs = build_obs_dict(img1, img2, state_reordered, args.lang)
 
             t0 = time.perf_counter()
             action_dict = client.get_action(obs)
@@ -600,7 +692,10 @@ def main(args: ArgsConfig):
                     daemon=True,
                 )
                 grip_thread.start()
-                sensor.send_chunk_action(arm_chunk, args.dt)
+                if args.controller == "forward_position_controller":
+                    sensor.send_chunk_action_fpc(arm_chunk, args.dt)
+                else:
+                    sensor.send_chunk_action(arm_chunk, args.dt)
                 grip_thread.join()
 
             elif args.send_mode == "single":

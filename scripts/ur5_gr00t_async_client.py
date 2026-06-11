@@ -73,17 +73,18 @@ class Gr00tAsyncClient:
         modality_keys=None,
         lang="pick up the object",
         action_horizon=16,
-        chunk_size_threshold=0.7,
-        dt=0.05,
+        chunk_size_threshold=0.4,
+        dt=0.07,
         aggregate_fn_name="conservative",
         send_mode="chunk",
-        chunk_dispatch_size=4,
+        chunk_dispatch_size=8,
         chunk_filter="rts",
         chunk_filter_q=1e-3,
         chunk_filter_r=1e-4,
         chunk_filter_window=7,
         chunk_filter_polyorder=3,
         api_token=None,
+        plot=False,
     ):
         self.client = RobotInferenceClient(host=host, port=port, api_token=api_token)
         self.modality_keys = modality_keys or ["ur5_arm", "gripper"]
@@ -114,12 +115,26 @@ class Gr00tAsyncClient:
         self.global_timestep = 0
         self.max_queue_size = action_horizon
 
+        # Dispatch anchor: (first_timestep, perf_counter) of the sub-chunk the
+        # controller is currently executing. Lets the receiver estimate the
+        # robot's TRUE physical timestep at obs capture from wall-clock elapsed
+        # (controller runs the sub-chunk at fixed dt cadence), instead of the
+        # dispatch counter global_timestep which leads physical by up to sub_size.
+        # Tuple assignment is atomic under the GIL → no lock needed.
+        self.dispatch_anchor = (0, None)
+
         # Inference rate tracker
         self._inference_fps = FPSTracker(target_fps=1.0 / dt)
         self._obs_count = 0
 
         # Robot reference (set in run())
         self.robot = None
+
+        # Action recording (for --plot). Each entry is the commanded action
+        # (7,) actually dispatched to the robot, post-filter.
+        self.plot = plot
+        self.executed_actions = []
+        self.record_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Observation / Inference
@@ -134,13 +149,19 @@ class Gr00tAsyncClient:
             "annotation.human.task_description": [self.lang],
         }
 
-    def _get_action_chunk(self, img1, img2, state):
-        """Send obs via ZMQ (BLOCKS), return list of TimedAction."""
+    def _get_action_chunk(self, img1, img2, state, base_step):
+        """Send obs via ZMQ (BLOCKS), return list of TimedAction.
+
+        base_step is the timestep the robot is at when `obs` was CAPTURED, so
+        action[0] aligns with absolute timestep base_step. It MUST be snapshotted
+        before inference: the blocking ZMQ call advances global_timestep, so
+        reading it here would mislabel the chunk later in time and break merge
+        alignment (new vs old actions for different physical moments get blended).
+        """
         obs = self._build_obs_dict(img1, img2, state)
         raw = self.client.get_action(obs)
         # raw = {"action.ur5_arm": (16, 6), "action.gripper": (16, 1)}
 
-        base_step = self.global_timestep
         timed_actions = []
         for i in range(self.action_horizon):
             flat = np.concatenate(
@@ -157,22 +178,22 @@ class Gr00tAsyncClient:
     def _aggregate_into_queue(self, incoming):
         """Merge incoming actions into the queue, blending overlapping timesteps."""
         with self.queue_lock:
-            existing = {a.timestep: a for a in self.action_queue}
+            with self.latest_step_lock:
+                latest = self.latest_executed_step
 
-        with self.latest_step_lock:
-            latest = self.latest_executed_step
+            # rebuild from the LIVE queue, dropping already-executed steps
+            existing = {a.timestep: a for a in self.action_queue if a.timestep > latest}
 
-        for new_a in incoming:
-            if new_a.timestep <= latest:
-                continue  # already executed
-            if new_a.timestep in existing:
-                old_action = existing[new_a.timestep].action
-                blended = self.aggregate_fn(old_action, new_a.action)
-                existing[new_a.timestep] = TimedAction(new_a.timestep, blended)
-            else:
-                existing[new_a.timestep] = new_a
+            for new_a in incoming:
+                if new_a.timestep <= latest:
+                    continue  # already executed
+                if new_a.timestep in existing:
+                    old_action = existing[new_a.timestep].action
+                    blended = self.aggregate_fn(old_action, new_a.action)
+                    existing[new_a.timestep] = TimedAction(new_a.timestep, blended)
+                else:
+                    existing[new_a.timestep] = new_a
 
-        with self.queue_lock:
             self.action_queue = collections.deque(
                 sorted(existing.values(), key=lambda a: a.timestep)
             )
@@ -221,6 +242,19 @@ class Gr00tAsyncClient:
                 time.sleep(0.001)
                 continue
 
+            # Estimate the robot's TRUE physical timestep at obs capture.
+            # action[0] of the returned chunk corresponds to this step. Derived
+            # from the active sub-chunk's dispatch anchor + wall-clock elapsed
+            # (controller executes at fixed dt cadence), NOT global_timestep,
+            # which leads the physical state by up to sub_size. Must be computed
+            # before the blocking inference call.
+            t_obs = time.perf_counter()
+            anchor_step, anchor_wall = self.dispatch_anchor
+            if anchor_wall is None:
+                with self.queue_lock:
+                    base_step = self.global_timestep  # before first dispatch
+            else:
+                base_step = anchor_step + int(round((t_obs - anchor_wall) / self.dt))
             img1, img2, state = self.robot.get_observation()
             infer_fps = self._inference_fps.tick()
             self._obs_count += 1
@@ -228,7 +262,7 @@ class Gr00tAsyncClient:
                 print(f"[inference_rate] {infer_fps:.2f} Hz  (camera fps logged separately)")
 
             try:
-                timed_actions = self._get_action_chunk(img1, img2, state)
+                timed_actions = self._get_action_chunk(img1, img2, state, base_step)
             except Exception as e:
                 print(f"[action_receiver] Inference error: {e}")
                 time.sleep(0.1)
@@ -284,10 +318,13 @@ class Gr00tAsyncClient:
 
             # Drain sub_size actions (leaves the rest in queue for fusion)
             chunk = []
+            first_ts = None
             with self.queue_lock:
                 take = min(sub_size, len(self.action_queue), num_steps - steps_executed)
                 for _ in range(take):
                     timed = self.action_queue.popleft()
+                    if first_ts is None:
+                        first_ts = timed.timestep
                     chunk.append(timed.action)
                     with self.latest_step_lock:
                         self.latest_executed_step = timed.timestep
@@ -300,7 +337,16 @@ class Gr00tAsyncClient:
             arm_chunk  = self._apply_chunk_filter(chunk_arr[:, :6])   # (S, 6)
             grip_chunk = chunk_arr[:, 6].tolist()                     # list of S floats
 
+            if self.plot:
+                # record the commanded values actually dispatched (post-filter)
+                commanded = np.column_stack([arm_chunk, chunk_arr[:, 6]])  # (S, 7)
+                with self.record_lock:
+                    self.executed_actions.extend(commanded)
+
             dispatch_start = time.perf_counter()
+            # Anchor this sub-chunk's first step to its dispatch wall-clock so the
+            # receiver can estimate the robot's physical step at obs time.
+            self.dispatch_anchor = (first_ts, dispatch_start)
             self.robot.send_chunk(arm_chunk, grip_chunk)
             steps_executed += len(chunk)
             sub_idx += 1
@@ -332,6 +378,9 @@ class Gr00tAsyncClient:
                     self.global_timestep = timed_action.timestep + 1
 
             if action is not None:
+                if self.plot:
+                    with self.record_lock:
+                        self.executed_actions.append(np.asarray(action))
                 self.robot.send_action(action)
 
             elapsed = time.perf_counter() - loop_start
@@ -340,6 +389,36 @@ class Gr00tAsyncClient:
             if step % 100 == 0:
                 measured_fps = fps.tick()
                 print(f"[control_loop] Step {step}, FPS: {measured_fps:.1f}")
+
+    def _plot_actions(self):
+        """Plot every commanded joint value vs action index. Saves a PNG."""
+        with self.record_lock:
+            if not self.executed_actions:
+                print("[plot] No actions recorded, skipping plot.")
+                return
+            actions = np.array(self.executed_actions)  # (N, 7)
+
+        import matplotlib
+        matplotlib.use("Agg")  # headless-safe
+        import matplotlib.pyplot as plt
+
+        names = ["pan", "lift", "elbow", "wrist1", "wrist2", "wrist3", "gripper"]
+        n_joints = actions.shape[1]
+        fig, axes = plt.subplots(n_joints, 1, sharex=True, figsize=(10, 2 * n_joints))
+        axes = np.atleast_1d(axes)
+        x = np.arange(actions.shape[0])
+        for j in range(n_joints):
+            axes[j].plot(x, actions[:, j], lw=0.8)
+            axes[j].set_ylabel(names[j] if j < len(names) else f"j{j}")
+            axes[j].grid(True, alpha=0.3)
+        axes[-1].set_xlabel("action index")
+        fig.suptitle(f"Commanded joint values ({actions.shape[0]} actions, mode={self.send_mode})")
+        fig.tight_layout()
+
+        path = f"actions_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[plot] Saved {actions.shape[0]} actions plot -> {path}")
 
     def run(self, robot, num_steps=1000):
         """
@@ -365,6 +444,8 @@ class Gr00tAsyncClient:
             self.shutdown_event.set()
             receiver.join(timeout=2.0)
             print("[async_client] Shutdown complete")
+            if self.plot:
+                self._plot_actions()
 
 
 @dataclass
@@ -393,6 +474,9 @@ class AsyncArgsConfig:
     chunk_filter_polyorder: int = 3   # savgol: < chunk_filter_window
     chunk_filter_q: float = 1e-3      # rts: process noise
     chunk_filter_r: float = 1e-4      # rts: measurement noise
+
+    # Diagnostics
+    plot: bool = False                # record commanded actions, save joint plot on exit
 
 
 def main(args: AsyncArgsConfig):
@@ -475,6 +559,7 @@ def main(args: AsyncArgsConfig):
         chunk_filter_r=args.chunk_filter_r,
         chunk_filter_window=args.chunk_filter_window,
         chunk_filter_polyorder=args.chunk_filter_polyorder,
+        plot=args.plot,
     )
 
     try:

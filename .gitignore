@@ -125,4 +125,6 @@ output/
 
 # Zack ignore
 .claude/
+.antigravitycli/
 attention_outputs/
+inference_images/

@@ -1,4 +1,5 @@
 import os
+import random
 import subprocess
 import time
 import threading
@@ -20,6 +21,7 @@ from std_msgs.msg import Float64MultiArray
 from gr00t.eval.robot import RobotInferenceClient
 from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk, blend_chunk_boundary
 from scipy.signal import savgol_filter
+from pynput import keyboard
 
 # Azure Kinect
 import pyk4a
@@ -79,12 +81,21 @@ HOME_JOINT_POSITIONS = np.array([
 
 HOME_TOLERANCE = 0.05
 
+TASK = ["place apple in the basket.",
+        "place apple in the wooden plate.",
+        "place apple in the white plate.",
+        "place mango in the basket.",
+        "place mango in the wooden plate.",
+        "place mango in the white plate.",
+        "place green pepper in the basket.",
+        "place green pepper in the wooden plate.",
+        "place green pepper in the white plate."]
 
 @dataclass
 class ArgsConfig:
     host: str = "localhost"
     port: int = 5555
-    lang: str = "place the small cube on the red box."
+    lang: str | None = None
     action_horizon: int = 16
     dt: float = 0.15
     num_cycles: int = 300
@@ -609,72 +620,113 @@ def main(args: ArgsConfig):
 
     prev_gripper = 0.0
     returning_home = False
+    inferring = False
+    quit_flag = False
+    use_random_task = args.lang is None
+    task_idx = 0
+    if use_random_task:
+        task_idx = random.randrange(len(TASK))
+        args.lang = TASK[task_idx]
+    print(f"Task [{task_idx}]: {args.lang}")
     prev_chunk_end_pos: np.ndarray | None = None  # (6,) last commanded arm position
     prev_chunk_end_vel: np.ndarray | None = None  # (6,) estimated velocity at end of chunk
+
+    def on_press(key):
+        nonlocal inferring, returning_home, quit_flag
+        try:
+            ch = key.char
+        except AttributeError:
+            return
+        if ch == 's':
+            inferring = True
+            print("[KB] Inference started")
+        elif ch == 'p':
+            inferring = False
+            print("[KB] Inference paused")
+        elif ch == 'h':
+            returning_home = True
+            print("[KB] Returning home")
+        elif ch == 'q':
+            quit_flag = True
+            print("[KB] Quit requested")
+
+    kb_listener = keyboard.Listener(on_press=on_press)
+    kb_listener.start()
+    print("Keyboard ready: s=start  p=pause  h=home  q=quit")
 
     os.makedirs("inference_images", exist_ok=True)
 
     # --- Control loop ---
     try:
-        for cycle in range(args.num_cycles):
-            time.sleep(0.3)
-            img1 = sensor.get_azure_kinect_image(args.buffer)
-            # img2 = sensor.get_realsense_image()
-            img2 = sensor.get_wfov_image(args.buffer)
+        cycle = 0
+        while cycle < args.num_cycles:
+            if quit_flag:
+                break
+            if not inferring and not returning_home:
+                time.sleep(0.1)
+                continue
+
             state = sensor.get_joint_state()
-
-            if img1 is not None:
-                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_k4a.jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
-            if img2 is not None:
-                cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
-
             state_reordered = state[[5, 0, 1, 2, 3, 4, 6]]
-            obs = build_obs_dict(img1, img2, state_reordered, args.lang)
 
-            t0 = time.perf_counter()
-            action_dict = client.get_action(obs)
-            t_infer = time.perf_counter() - t0
-
-            arm_actions = np.atleast_2d(action_dict["action.ur5_arm"])   # (H, 6)
-            gripper_actions = np.atleast_1d(action_dict["action.gripper"]).flatten()  # (H,)
-
-            arm_chunk = []
-            grip_chunk = []
-            for i in range(args.action_horizon):
-                arm_pos = arm_actions[i]
-                grip_pos = gripper_actions[i]
-                if args.filter:
-                    arm_pos = np.array([arm_filters[j](arm_pos[j]) for j in range(6)])
-                    grip_pos = grip_filter(grip_pos)
-                arm_chunk.append(arm_pos)
-                grip_chunk.append(grip_pos)
-
-            # --- Within-chunk smoothing ---
-            arm_chunk_arr = np.array(arm_chunk)    # (H, 6)
-            grip_chunk_arr = np.array(grip_chunk)  # (H,)
-
-            if args.chunk_filter == "savgol":
-                arm_chunk_arr = savgol_chunk(arm_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
-                grip_chunk_arr = savgol_filter(grip_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
-            elif args.chunk_filter == "rts":
-                arm_chunk_arr = rts_smoother_chunk(arm_chunk_arr, dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r)
-                grip_chunk_arr = rts_smoother_chunk(grip_chunk_arr[:, np.newaxis], dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r).squeeze(1)
-
-            arm_chunk = arm_chunk_arr
-            grip_chunk = grip_chunk_arr.tolist()
-
-            if cycle > 26:
-                returning_home = True
-
+            # --- Return-home path: skip inference ---
             if returning_home:
-                if is_at_home(state_reordered):
-                    print("Home pose reached, resuming normal operation...")
-                    args.dt = dt
-                    returning_home = False
-                else:
-                    arm_chunk = [HOME_JOINT_POSITIONS.copy()] * args.action_horizon
-                    grip_chunk = [0.0] * args.action_horizon  # open gripper
-                    args.dt = 2.0
+                if not is_at_home(state_reordered):
+                    sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
+                    sensor.send_gripper_command(0.0, max_effort=args.gripper_max_effort)
+                if use_random_task:
+                    task_idx = random.randrange(len(TASK))
+                    args.lang = TASK[task_idx]
+                print(f"Home pose reached. Next task [{task_idx}]: {args.lang}")
+                args.dt = dt
+                returning_home = False
+                prev_chunk_end_pos = None
+                prev_chunk_end_vel = None
+                continue
+
+            else:
+                # time.sleep(0.2)
+                img1 = sensor.get_azure_kinect_image(args.buffer)
+                img2 = sensor.get_wfov_image(args.buffer)
+
+                if img1 is not None:
+                    cv2.imwrite(f"inference_images/cycle_{cycle:04d}_k4a.jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
+                if img2 is not None:
+                    cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
+
+                obs = build_obs_dict(img1, img2, state_reordered, args.lang)
+
+                t0 = time.perf_counter()
+                action_dict = client.get_action(obs)
+                t_infer = time.perf_counter() - t0
+
+                arm_actions = np.atleast_2d(action_dict["action.ur5_arm"])   # (H, 6)
+                gripper_actions = np.atleast_1d(action_dict["action.gripper"]).flatten()  # (H,)
+
+                arm_chunk = []
+                grip_chunk = []
+                for i in range(args.action_horizon):
+                    arm_pos = arm_actions[i]
+                    grip_pos = gripper_actions[i]
+                    if args.filter:
+                        arm_pos = np.array([arm_filters[j](arm_pos[j]) for j in range(6)])
+                        grip_pos = grip_filter(grip_pos)
+                    arm_chunk.append(arm_pos)
+                    grip_chunk.append(grip_pos)
+
+                # --- Within-chunk smoothing ---
+                arm_chunk_arr = np.array(arm_chunk)    # (H, 6)
+                grip_chunk_arr = np.array(grip_chunk)  # (H,)
+
+                if args.chunk_filter == "savgol":
+                    arm_chunk_arr = savgol_chunk(arm_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
+                    grip_chunk_arr = savgol_filter(grip_chunk_arr, args.chunk_filter_window, args.chunk_filter_polyorder)
+                elif args.chunk_filter == "rts":
+                    arm_chunk_arr = rts_smoother_chunk(arm_chunk_arr, dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r)
+                    grip_chunk_arr = rts_smoother_chunk(grip_chunk_arr[:, np.newaxis], dt=args.dt, q=args.chunk_filter_q, r=args.chunk_filter_r).squeeze(1)
+
+                arm_chunk = arm_chunk_arr
+                grip_chunk = grip_chunk_arr.tolist()
 
             # --- Boundary blending + state update (skip when overriding to home) ---
             if not returning_home:
@@ -727,7 +779,9 @@ def main(args: ArgsConfig):
             #         sensor.send_gripper_command(grip_pos, max_effort=args.gripper_max_effort)
 
             print(f"Cycle {cycle}: inference={t_infer:.3f}s")
+            cycle += 1
     finally:
+        kb_listener.stop()
         sensor.stop()
         sensor.destroy_node()
         rclpy.shutdown()

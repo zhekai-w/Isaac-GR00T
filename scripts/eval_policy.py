@@ -135,6 +135,54 @@ class ArgsConfig:
     """Number of waypoints to blend at chunk boundaries (N * dt seconds)."""
 
 
+def compute_rms_jerk(traj: np.ndarray, dt: float) -> float:
+    """RMS jerk (third derivative of position) over a (T, D) trajectory."""
+    jerk = np.diff(traj, n=3, axis=0) / (dt ** 3)
+    return float(np.sqrt(np.mean(jerk ** 2)))
+
+
+def jerk_per_step(traj: np.ndarray, dt: float) -> np.ndarray:
+    """Per-timestep jerk norm. traj: (T, D). Returns (T-3,)."""
+    jerk = np.diff(traj, n=3, axis=0) / (dt ** 3)
+    return np.linalg.norm(jerk, axis=1)
+
+
+def plot_jerk(raw_traj: np.ndarray, filt_traj: np.ndarray, dt: float,
+              traj_id: int, save_plot_path: str | None = None) -> None:
+    from pathlib import Path
+    import matplotlib
+    if save_plot_path:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    j_raw = jerk_per_step(raw_traj, dt)
+    j_filt = jerk_per_step(filt_traj, dt)
+    rms_raw = compute_rms_jerk(raw_traj, dt)
+    rms_filt = compute_rms_jerk(filt_traj, dt)
+    reduction = 100 * (rms_raw - rms_filt) / rms_raw if rms_raw > 0 else 0.0
+    t = np.arange(len(j_raw))
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, j_raw, label=f"raw  RMS={rms_raw:.2f}", alpha=0.7)
+    ax.plot(t, j_filt, label=f"filtered  RMS={rms_filt:.2f}  ({reduction:.1f}% reduction)", linestyle="--")
+    ax.set_yscale("log")
+    ax.set_title(f"Jerk Magnitude (‖d³q/dt³‖) — Trajectory {traj_id}", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Time Step")
+    ax.set_ylabel("Jerk")
+    ax.legend(loc="upper right", framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_plot_path:
+        out = Path(save_plot_path) / f"jerk_traj_{traj_id:04d}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"  Saved jerk plot: {out}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
 def main(args: ArgsConfig):
     data_config = load_data_config(args.data_config)
 
@@ -201,6 +249,8 @@ def main(args: ArgsConfig):
             "chunk_filter_polyorder must be < chunk_filter_window"
 
     all_mse = []
+    all_jerk_raw: list = []
+    all_jerk_filtered: list = []
     all_inference_times = []
     total_start = time.perf_counter()
 
@@ -256,6 +306,19 @@ def main(args: ArgsConfig):
 
             chunk_filter_fn = _make_chunk_filter(prev_state)
 
+        # Always wrap chunk_filter_fn to collect raw/filtered chunks for jerk
+        raw_chunks: list = []
+        filtered_chunks: list = []
+        _inner_fn = chunk_filter_fn
+
+        def _jerk_collector(chunk, _inner=_inner_fn):
+            raw_chunks.append(chunk.copy())
+            out = _inner(chunk) if _inner is not None else chunk
+            filtered_chunks.append(out.copy())
+            return out
+
+        chunk_filter_fn = _jerk_collector
+
         # Run the full eval (with MSE + plotting)
         mse = calc_mse_for_single_trajectory(
             policy,
@@ -273,6 +336,17 @@ def main(args: ArgsConfig):
         print("MSE:", mse)
         all_mse.append(mse)
 
+        if len(raw_chunks) >= 4:
+            raw_traj = np.concatenate(raw_chunks, axis=0)
+            filt_traj = np.concatenate(filtered_chunks, axis=0)
+            rj_raw = compute_rms_jerk(raw_traj, args.dt)
+            rj_filt = compute_rms_jerk(filt_traj, args.dt)
+            print(f"RMS Jerk  — raw: {rj_raw:.4f}  filtered: {rj_filt:.4f}  reduction: {100*(rj_raw-rj_filt)/rj_raw:.1f}%")
+            all_jerk_raw.append(rj_raw)
+            all_jerk_filtered.append(rj_filt)
+            if args.plot:
+                plot_jerk(raw_traj, filt_traj, args.dt, traj_id, args.save_plot_path)
+
     total_elapsed = time.perf_counter() - total_start
 
     print("\n--- Timing Summary ---")
@@ -282,6 +356,8 @@ def main(args: ArgsConfig):
     print(f"Max inference time:    {np.max(all_inference_times):.4f}s")
     print(f"Total wall time:       {total_elapsed:.2f}s")
     print(f"Average MSE across all trajs: {np.mean(all_mse)}")
+    if all_jerk_raw:
+        print(f"Mean RMS Jerk — raw: {np.mean(all_jerk_raw):.4f}  filtered: {np.mean(all_jerk_filtered):.4f}  reduction: {100*(np.mean(all_jerk_raw)-np.mean(all_jerk_filtered))/np.mean(all_jerk_raw):.1f}%")
     print("Done")
     exit()
 

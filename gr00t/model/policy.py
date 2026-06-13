@@ -237,7 +237,20 @@ class Gr00tPolicy(BasePolicy):
         return True
 
     def _load_model(self, model_path):
-        model = GR00T_N1_5.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
+        # Pick the model class from the checkpoint's model_type so SmolVLA-head
+        # checkpoints don't get loaded as the original DiT-head GR00T_N1_5.
+        model_cls = GR00T_N1_5
+        try:
+            with open(Path(model_path) / "config.json") as f:
+                model_type = json.load(f).get("model_type")
+            if model_type == "gr00t_n1_5_smolvla":
+                from gr00t.model.gr00t_n1_smolvla import GR00T_N1_5_SmolVLA
+
+                model_cls = GR00T_N1_5_SmolVLA
+        except FileNotFoundError:
+            pass
+
+        model = model_cls.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
         model.eval()  # Set model to eval mode
 
         # Update action_horizon to match modality config
@@ -253,13 +266,9 @@ class Gr00tPolicy(BasePolicy):
             new_action_head_config = model.action_head.config
             new_action_head_config.action_horizon = expected_action_horizon
 
-            # Import the FlowmatchingActionHead class
-            from gr00t.model.action_head.flow_matching_action_head import (
-                FlowmatchingActionHead,
-            )
-
-            # Create new action head with updated config
-            new_action_head = FlowmatchingActionHead(new_action_head_config)
+            # Recreate using the same head class the checkpoint loaded
+            # (FlowmatchingActionHead or SmolVLAActionHead), not a hardcoded one.
+            new_action_head = type(model.action_head)(new_action_head_config)
 
             # Copy the weights from the old action head to the new one
             new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)

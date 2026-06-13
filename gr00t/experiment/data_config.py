@@ -882,6 +882,13 @@ class UR52F85DataConfig(BaseDataConfig):
         ]
         return ComposedModalityTransform(transforms=transforms)
 
+
+# Same UR5 + 2F85 setup, but action horizon 50 to match the gr00t-smolvla checkpoint
+# (finetuned at horizon 50). Only action_indices changes; transform reads it via
+# len(self.action_indices), so 50 propagates to GR00TTransform automatically.
+class UR5Gr00tSmolVLADataConfig(UR52F85DataConfig):
+    action_indices = list(range(50))
+
 ###########################################################################################
 class UR5eTwoCamDataConfig(BaseDataConfig):
     video_keys = [
@@ -992,4 +999,5 @@ DATA_CONFIG_MAP = {
     "ur5e_twocam": UR5eTwoCamDataConfig(),
     "agibot_genie1": AgibotGenie1DataConfig(),
     "ur5_2f85_arm_gripper":UR52F85DataConfig(),
+    "ur5_gr00tsmolvla": UR5Gr00tSmolVLADataConfig(),
 }

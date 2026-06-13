@@ -1,0 +1,417 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Standalone copy of ``gr00t_finetune.py`` that fine-tunes the SmolVLA action-head variant
+(``GR00T_N1_5_SmolVLA``, model_type ``gr00t_n1_5_smolvla``).
+
+The base checkpoint (``nvidia/GR00T-N1.5-3B``) ships a *flowmatching* action head. This script
+loads the pretrained Eagle backbone from that checkpoint, then attaches a freshly-initialized
+SmolVLA action expert sized to the data config (``action_head_cfg["type"] = "smolvla"``). The
+SmolVLA head weights are not present in the checkpoint, so they are random-initialized and trained
+from scratch (non-strict load); only the backbone is pretrained. The original ``gr00t_finetune.py``
+stays untouched.
+"""
+
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Literal
+
+import torch
+import tyro
+from transformers import TrainingArguments
+
+from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.schema import EmbodimentTag
+from gr00t.experiment.data_config import load_data_config
+from gr00t.experiment.runner import TrainRunner
+from gr00t.model.gr00t_n1_smolvla import GR00T_N1_5_SmolVLA, GR00T_N1_5_SmolVLA_Config
+from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
+from gr00t.utils.peft import get_lora_model
+
+
+@dataclass
+class ArgsConfig:
+    """Configuration for GR00T SmolVLA-variant fine-tuning."""
+
+    # Dataset parameters
+    dataset_path: List[str]
+    """Path to the dataset directory or directories, we assume all datasets have the same data config"""
+
+    output_dir: str = "/tmp/gr00t_smolvla"
+    """Directory to save model checkpoints."""
+
+    data_config: str = "fourier_gr1_arms_only"
+    """
+    Data configuration to use for training.
+    Options:
+    - Built-in configs: Use predefined config names like 'so100', 'fourier_gr1_arms_only', 'unitree_g1'.
+    - External configs: Use 'module:ClassName' format to load custom configs from external files. e.g. 'my_dir.my_configs:RobotConfig'
+    See gr00t/experiment/data_config.py for more details.
+    """
+
+    # Training parameters
+    batch_size: int = 32
+    """Batch size per GPU for training."""
+
+    max_steps: int = 10000
+    """Maximum number of training steps."""
+
+    num_gpus: int = 1
+    """Number of GPUs to use for training."""
+
+    save_steps: int = 1000
+    """Number of steps between saving checkpoints."""
+
+    # Model parameters
+    base_model_path: str = "nvidia/GR00T-N1.5-3B"
+    """Path or HuggingFace model ID for the base model. The backbone is loaded pretrained; the
+    SmolVLA action head is initialized from scratch."""
+
+    tune_llm: bool = False
+    """Whether to fine-tune the language model backbone."""
+
+    tune_visual: bool = False
+    """Whether to fine-tune the vision tower."""
+
+    tune_projector: bool = True
+    """Whether to fine-tune the SmolVLA action-head projector (state/action in-out projections)."""
+
+    tune_diffusion_model: bool = True
+    """Whether to fine-tune the SmolVLA action-head expert transformer."""
+
+    resume: bool = False
+    """Whether to resume from a checkpoint."""
+
+    # LoRA parameters
+    lora_rank: int = 0
+    """Rank for the LORA model. If 0, no LORA will be used."""
+
+    lora_alpha: int = 16
+    """Alpha value for the LORA model."""
+
+    lora_dropout: float = 0.1
+    """Dropout rate for the LORA model."""
+
+    lora_full_model: bool = False
+    """Whether to apply LORA to the full model. If False, only the action head is targeted."""
+
+    # SmolVLA action-head architecture parameters (see SmolVLAActionHeadConfig)
+    expert_hidden_size: int = 720
+    """Hidden size of the SmolVLA action expert transformer."""
+
+    num_layers: int = 16
+    """Number of expert transformer layers."""
+
+    num_heads: int = 12
+    """Number of attention heads in the expert transformer."""
+
+    self_attn_every_n_layers: int = 2
+    """Use self-attention on every Nth layer (others use cross-attention to backbone features)."""
+
+    num_steps: int = 10
+    """Number of Euler integration steps at inference time."""
+
+    backbone_embedding_dim: int = 2048
+    """Dimension of the Eagle backbone features fed to the action head. GR00T's Eagle backbone
+    outputs 2048-dim features (the SmolVLAActionHeadConfig default of 1536 is for lerobot's SmolVLM2
+    and must be overridden here)."""
+
+    # Advanced training parameters
+    learning_rate: float = 1e-4
+    """Learning rate for training."""
+
+    weight_decay: float = 1e-5
+    """Weight decay for AdamW optimizer."""
+
+    warmup_ratio: float = 0.05
+    """Ratio of total training steps used for warmup."""
+
+    dataloader_num_workers: int = 12
+    """Number of workers for data loading per GPU."""
+
+    gradient_accumulation_steps: int = 1
+    """Gradient accumulation steps for training."""
+
+    dataloader_prefetch_factor: int = 4
+    """Prefetch factor for data loading."""
+
+    report_to: Literal["wandb", "tensorboard", "azure_ml"] = "wandb"
+    """Where to report training metrics (e.g., 'wandb', 'tensorboard', 'azure_ml')."""
+
+    # Data loading parameters
+    embodiment_tag: Literal[tuple(EMBODIMENT_TAG_MAPPING.keys())] = "new_embodiment"
+    """Embodiment tag to use for training. e.g. 'new_embodiment', 'gr1'"""
+
+    video_backend: Literal["torchcodec", "decord", "torchvision_av"] = "torchcodec"
+    """Video backend to use for training. [torchcodec, decord, torchvision_av]"""
+
+    # Mixture dataset parameters
+    balance_dataset_weights: bool = True
+    """Used in LeRobotMixtureDataset. If True, we will balance the dataset weights, by multiplying the total trajectory to each dataset"""
+
+    # Mixture dataset parameters
+    balance_trajectory_weights: bool = True
+    """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
+
+
+#####################################################################################
+# main training function
+#####################################################################################
+
+
+def main(config: ArgsConfig):
+    """Main training function."""
+    # ------------ step 1: load dataset ------------
+    embodiment_tag = EmbodimentTag(config.embodiment_tag)
+
+    # 1.1 modality configs and transforms
+    data_config_cls = load_data_config(config.data_config)
+    modality_configs = data_config_cls.modality_config()
+    transforms = data_config_cls.transform()
+
+    # 1.2 data loader: we will use either single dataset or mixture dataset
+    if len(config.dataset_path) == 1:
+        train_dataset = LeRobotSingleDataset(
+            dataset_path=config.dataset_path[0],
+            modality_configs=modality_configs,
+            transforms=transforms,
+            embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
+            video_backend=config.video_backend,
+        )
+    else:
+        single_datasets = []
+        for p in config.dataset_path:
+            assert os.path.exists(p), f"Dataset path {p} does not exist"
+            ## We use the same transforms, modality configs, and embodiment tag for all datasets here,
+            ## in reality, you can use dataset from different modalities and embodiment tags
+            dataset = LeRobotSingleDataset(
+                dataset_path=p,
+                modality_configs=modality_configs,
+                transforms=transforms,
+                embodiment_tag=embodiment_tag,
+                video_backend=config.video_backend,
+            )
+            single_datasets.append(dataset)
+
+        train_dataset = LeRobotMixtureDataset(
+            data_mixture=[
+                (dataset, 1.0)  # we will use equal weights for all datasets
+                for dataset in single_datasets
+            ],
+            mode="train",
+            balance_dataset_weights=config.balance_dataset_weights,
+            balance_trajectory_weights=config.balance_trajectory_weights,
+            seed=42,
+            metadata_config={
+                "percentile_mixing_method": "weighted_average",
+            },
+        )
+        print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
+
+    # ------------ step 2: load model ------------
+    # Determine action horizon and dims from the data config (same inspection as gr00t_finetune.py).
+    data_action_horizon = len(data_config_cls.action_indices)
+
+    # Assert that the last transform is a GR00TTransform and has max_action_dim / max_state_dim
+    assert (
+        hasattr(transforms, "transforms") and len(transforms.transforms) > 0
+    ), "No transforms found"
+    last_transform = transforms.transforms[-1]
+    from gr00t.model.transforms import GR00TTransform
+
+    assert isinstance(last_transform, GR00TTransform), "Last transform must be GR00TTransform"
+    assert hasattr(last_transform, "max_action_dim"), "GR00TTransform must have max_action_dim"
+    data_max_action_dim = last_transform.max_action_dim
+    data_max_state_dim = last_transform.max_state_dim
+
+    # Build a fresh SmolVLA action-head config, sized to the data config, and override the base
+    # checkpoint's (flowmatching) action_head_cfg so the SmolVLA head is selected at construction.
+    model_config = GR00T_N1_5_SmolVLA_Config.from_pretrained(config.base_model_path)
+    model_config.action_head_cfg = {
+        "type": "smolvla",
+        "action_dim": data_max_action_dim,
+        "action_horizon": data_action_horizon,
+        "max_state_dim": data_max_state_dim,
+        "backbone_embedding_dim": config.backbone_embedding_dim,
+        "expert_hidden_size": config.expert_hidden_size,
+        "num_layers": config.num_layers,
+        "num_heads": config.num_heads,
+        "self_attn_every_n_layers": config.self_attn_every_n_layers,
+        "num_steps": config.num_steps,
+        "tune_projector": config.tune_projector,
+        "tune_diffusion_model": config.tune_diffusion_model,
+    }
+    model_config.action_horizon = data_action_horizon
+    model_config.action_dim = data_max_action_dim
+
+    print(
+        f"SmolVLA action head: action_horizon={data_action_horizon}, "
+        f"action_dim={data_max_action_dim}, max_state_dim={data_max_state_dim}"
+    )
+
+    # Load model: backbone loads pretrained from the checkpoint; the SmolVLA action head has no
+    # weights in the checkpoint, so it is fresh and trained from scratch (non-strict load). Expect
+    # HF warnings about missing action_head.* keys and unexpected flowmatching keys.
+    model = GR00T_N1_5_SmolVLA.from_pretrained(
+        pretrained_model_name_or_path=config.base_model_path,
+        config=model_config,
+        tune_llm=config.tune_llm,  # backbone's LLM
+        tune_visual=config.tune_visual,  # backbone's vision tower
+        tune_projector=config.tune_projector,  # action head's projector
+        tune_diffusion_model=config.tune_diffusion_model,  # action head's expert
+    )
+
+    # CRITICAL: re-initialize the SmolVLA action head. HF `from_pretrained` builds the model inside a
+    # `no_init_weights()` context (which no-ops `nn.Linear.reset_parameters`) and then only fills in
+    # params present in the checkpoint, relying on the model's `_init_weights` to initialize the rest.
+    # GR00T's PreTrainedModel subclass defines no `_init_weights`, so the entirely-fresh SmolVLA head
+    # is left as uninitialized garbage memory (~1e14-1e35) and explodes to NaN under bf16. Rebuilding
+    # the head via its normal constructor (outside that context) runs the real nn.Linear/RMSNorm init.
+    # `vlln` is the one head tensor present in the base (flowmatching) checkpoint, so preserve it.
+    from gr00t.model.action_head.smolvla_action_head import (
+        SmolVLAActionHead,
+        SmolVLAActionHeadConfig,
+    )
+
+    head_kwargs = {k: v for k, v in model_config.action_head_cfg.items() if k != "type"}
+    fresh_head = SmolVLAActionHead(SmolVLAActionHeadConfig(**head_kwargs))
+    if not any(torch.isnan(p).any() or torch.isinf(p).any() for p in model.action_head.vlln.parameters()):
+        fresh_head.vlln.load_state_dict(model.action_head.vlln.state_dict())  # keep pretrained vlln
+    fresh_head.set_trainable_parameters(
+        tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
+    )
+    model.action_head = fresh_head.to(model.device)
+
+    # Set the model's compute_dtype to bfloat16
+    model.compute_dtype = "bfloat16"
+    model.config.compute_dtype = "bfloat16"
+
+    if config.lora_rank > 0:
+        # LoRA targets attention Linears (q_proj/k_proj/v_proj) which the SmolVLA ExpertBlock
+        # exposes by those exact names, so action_head_only LoRA works out of the box.
+        model = get_lora_model(
+            model,
+            rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            action_head_only=not config.lora_full_model,
+        )
+
+    # 2.1 modify training args
+    training_args = TrainingArguments(
+        output_dir=config.output_dir,
+        run_name=None,
+        remove_unused_columns=False,
+        deepspeed="",
+        gradient_checkpointing=False,
+        bf16=True,
+        tf32=True,
+        per_device_train_batch_size=config.batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        dataloader_num_workers=config.dataloader_num_workers,
+        dataloader_pin_memory=False,
+        dataloader_prefetch_factor=config.dataloader_prefetch_factor,
+        dataloader_persistent_workers=config.dataloader_num_workers > 0,
+        optim="adamw_torch",
+        adam_beta1=0.95,
+        adam_beta2=0.999,
+        adam_epsilon=1e-8,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay,
+        warmup_ratio=config.warmup_ratio,
+        lr_scheduler_type="cosine",
+        logging_steps=10.0,
+        num_train_epochs=300,
+        max_steps=config.max_steps,
+        save_strategy="steps",
+        save_steps=config.save_steps,
+        # evaluation_strategy="no",
+        save_total_limit=5,
+        report_to=config.report_to,
+        seed=42,
+        do_eval=False,
+        ddp_find_unused_parameters=False,
+        ddp_bucket_cap_mb=100,
+        torch_compile_mode=None,
+    )
+
+    # 2.2 run experiment
+    experiment = TrainRunner(
+        train_dataset=train_dataset,
+        model=model,
+        training_args=training_args,
+        resume_from_checkpoint=config.resume,
+    )
+
+    # 2.3 run experiment
+    experiment.train()
+
+
+if __name__ == "__main__":
+    # Parse arguments using tyro
+    config = tyro.cli(ArgsConfig)
+
+    # Print the tyro config
+    print("\n" + "=" * 50)
+    print("GR00T SmolVLA FINE-TUNING CONFIGURATION:")
+    print("=" * 50)
+    for key, value in vars(config).items():
+        print(f"{key}: {value}")
+    print("=" * 50 + "\n")
+
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+    # Validate GPU configuration
+    assert (
+        config.num_gpus <= available_gpus
+    ), f"Number of GPUs requested ({config.num_gpus}) is greater than the available GPUs ({available_gpus})"
+    assert config.num_gpus > 0, "Number of GPUs must be greater than 0"
+    print(f"Using {config.num_gpus} GPUs")
+
+    if config.num_gpus == 1:
+        # Single GPU mode - set CUDA_VISIBLE_DEVICES=0
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        # Run the script normally
+        main(config)
+    else:
+        if os.environ.get("IS_TORCHRUN", "0") == "1":
+            main(config)
+        else:
+            # Multi-GPU mode - use torchrun
+            script_path = Path(__file__).absolute()
+            # Remove any existing CUDA_VISIBLE_DEVICES from environment
+            if "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+
+            script_path = Path(__file__).absolute()
+
+            # Use subprocess.run instead of os.system
+            raw_args_list = sys.argv[1:]
+            cmd = [
+                "torchrun",
+                "--standalone",
+                f"--nproc_per_node={config.num_gpus}",
+                "--nnodes=1",  # default to 1 node for now
+                str(script_path),
+                *raw_args_list,
+            ]
+
+            print("Running torchrun command: ", cmd)
+            env = os.environ.copy()
+            env["IS_TORCHRUN"] = "1"
+            sys.exit(subprocess.run(cmd, env=env).returncode)

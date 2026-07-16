@@ -66,6 +66,9 @@ class Gr00tStreamingClient:
         chunk_size_threshold: float = 0.4,
         dt: float = 0.05,
         wait: bool = False,
+        lookahead: int = 4,
+        control_interface: str = "forward_position",
+        stream_hz: float = 125.0,
         aggregate_fn_name: str = "conservative",
         chunk_filter: str = "none",
         chunk_filter_q: float = 1e-3,
@@ -84,7 +87,17 @@ class Gr00tStreamingClient:
         self.chunk_size_threshold = chunk_size_threshold
         self.dt = dt
         self.wait = wait
+        self.lookahead = max(1, lookahead)
+        self.control_interface = control_interface
+        self.stream_hz = stream_hz
         self.aggregate_fn = AGGREGATE_FUNCTIONS[aggregate_fn_name]
+
+        # forward_position (servoj) streaming: the control loop sets a target
+        # segment per tick; a high-rate thread interpolates along it and
+        # publishes setpoints to the forward_position_controller.
+        self._segment_lock = threading.Lock()
+        self._segment: tuple[float, float, np.ndarray, np.ndarray] | None = None  # (t0, dur, from, to)
+        self._last_target: np.ndarray | None = None
 
         # Within-chunk smoothing (applied on the full chunk from inference, before queue insertion)
         self.chunk_filter = chunk_filter
@@ -115,6 +128,14 @@ class Gr00tStreamingClient:
 
         # Last sent gripper (for threshold deadband)
         self._last_grip_sent = 0.0
+
+        # Diagnostic log: per-tick wall time, timestep, commanded and measured positions
+        self._log_t: list[float] = []
+        self._log_step: list[int] = []
+        self._log_cmd: list[np.ndarray] = []
+        self._log_meas: list[np.ndarray] = []
+        self._log_prof: list[tuple] = []
+        self._log_grip_t: list[float] = []
 
     # ------------------------------------------------------------------
     # Observation / Inference
@@ -235,6 +256,27 @@ class Gr00tStreamingClient:
             self.must_go.set()
 
     # ------------------------------------------------------------------
+    # Thread 3 — forward_position (servoj) streamer
+    # ------------------------------------------------------------------
+
+    def _fpc_streamer_loop(self):
+        """Publishes interpolated setpoints at stream_hz along the current
+        segment (set by the control loop once per dt). This is the moveit_servo
+        pattern: servoj consumes a dense setpoint stream and its lookahead_time
+        smooths the remaining discretization."""
+        period = 1.0 / self.stream_hz
+        while not self.shutdown_event.is_set():
+            tick = time.perf_counter()
+            with self._segment_lock:
+                seg = self._segment
+            if seg is not None:
+                t0, dur, frm, to = seg
+                alpha = min(1.0, max(0.0, (tick - t0) / dur))
+                self.sensor.publish_fpc(frm + alpha * (to - frm))
+            elapsed = time.perf_counter() - tick
+            time.sleep(max(0.0, period - elapsed))
+
+    # ------------------------------------------------------------------
     # Thread 2 — Control Loop (main)
     # ------------------------------------------------------------------
 
@@ -249,45 +291,119 @@ class Gr00tStreamingClient:
             loop_start = time.perf_counter()
 
             action: TimedAction | None = None
+            window: list[np.ndarray] = []
             with self.queue_lock:
                 if self.action_queue:
                     timed_action = self.action_queue.popleft()
                     action = timed_action
+                    # Receding-horizon window: current action plus the next few
+                    # pending ones (peeked, not popped — they are re-sent with
+                    # shifted times next tick until actually executed).
+                    window = [timed_action.arm] + [
+                        a.arm for a in list(self.action_queue)[: self.lookahead - 1]
+                    ]
                     with self.latest_step_lock:
                         self.latest_executed_step = timed_action.timestep
 
+            t_pop = time.perf_counter()
+
+            t_send = t_grip = t_log = t_pop
             if action is not None:
-                arm = action.arm
                 grip = action.gripper
 
-                # Optional per-step low-pass filter
+                # Optional per-step low-pass filter (applied to the executed point)
                 if self._use_filter:
-                    arm = np.array([self._arm_filters[j](arm[j]) for j in range(6)])
+                    window[0] = np.array([self._arm_filters[j](window[0][j]) for j in range(6)])
                     grip = self._grip_filter(grip)
 
-                self.sensor.send_single_action_scaled_joint(arm, dt=self.dt, wait=self.wait)
+                if self.control_interface == "forward_position":
+                    # Hand the new target to the servoj streamer thread: it
+                    # interpolates from the previous target over dt at stream_hz.
+                    frm = self._last_target if self._last_target is not None else window[0]
+                    with self._segment_lock:
+                        self._segment = (time.perf_counter(), self.dt, frm, window[0])
+                    self._last_target = window[0]
+                else:
+                    # Finite-difference velocities so the spline passes through
+                    # each point at speed instead of stopping. Last point gets
+                    # zero velocity: it is superseded before being reached, and
+                    # JTC rejects nonzero end velocity by default.
+                    velocities = None
+                    if len(window) > 1:
+                        diffs = [(window[i + 1] - window[i]) / self.dt for i in range(len(window) - 1)]
+                        velocities = diffs + [np.zeros(6)]
+                    self.sensor.send_window_scaled_joint(window, dt=self.dt, velocities_window=velocities)
+                t_send = time.perf_counter()
 
                 # Gripper with deadband
                 if abs(grip - self._last_grip_sent) > GRIPPER_THRESHOLD:
                     self.sensor.send_gripper_command(float(grip))
                     self._last_grip_sent = grip
+                    self._log_grip_t.append(time.perf_counter())
+                t_grip = time.perf_counter()
+
+                meas = self.sensor.get_joint_state()
+                self._log_t.append(time.perf_counter())
+                self._log_step.append(action.timestep)
+                self._log_cmd.append(window[0].copy())
+                self._log_meas.append(
+                    meas[[5, 0, 1, 2, 3, 4]].copy() if meas is not None else np.full(6, np.nan)
+                )
+                t_log = time.perf_counter()
 
             # Maintain control frequency
             elapsed = time.perf_counter() - loop_start
-            time.sleep(max(0.0, self.dt - elapsed))
+            sleep_target = max(0.0, self.dt - elapsed)
+            time.sleep(sleep_target)
+            t_wake = time.perf_counter()
+            self._log_prof.append((
+                t_pop - loop_start,      # pop (incl. lock wait)
+                t_send - t_pop,          # send_window_scaled_joint
+                t_grip - t_send,         # gripper
+                t_log - t_grip,          # joint-state read + log append
+                sleep_target,            # requested sleep
+                t_wake - loop_start - elapsed - sleep_target,  # sleep overshoot
+            ))
 
     def run(self, num_steps: int = 1000):
         """Start both threads and run for `num_steps` control iterations."""
         assert self.client.ping(), "GR00T server not reachable"
 
+        # High-rate /joint_states recording for diagnostics
+        self.sensor.js_log = []
+        self.sensor.js_recording = True
+
         receiver = threading.Thread(target=self._action_receiver_loop, daemon=True)
         receiver.start()
+
+        if self.control_interface == "forward_position":
+            streamer = threading.Thread(target=self._fpc_streamer_loop, daemon=True)
+            streamer.start()
 
         try:
             self._control_loop(num_steps)
         finally:
             self.shutdown_event.set()
             receiver.join(timeout=2.0)
+            self.sensor.js_recording = False
+            if self._log_t:
+                np.savez(
+                    "streaming_log.npz",
+                    t=np.array(self._log_t),
+                    step=np.array(self._log_step),
+                    cmd=np.array(self._log_cmd),
+                    meas=np.array(self._log_meas),
+                    prof=np.array(self._log_prof),
+                    grip_t=np.array(self._log_grip_t),
+                    js=np.array(self.sensor.js_log) if self.sensor.js_log else np.zeros((0, 7)),
+                )
+                print(f"Diagnostic log saved: streaming_log.npz ({len(self._log_t)} ticks)")
+                prof = np.array(self._log_prof)
+                names = ["pop", "send", "grip", "log", "sleep_req", "sleep_over"]
+                print("per-tick section times (ms): median / p95 / max")
+                for i, n in enumerate(names):
+                    col = prof[:, i] * 1000
+                    print(f"  {n:10s} {np.median(col):7.1f} / {np.percentile(col, 95):7.1f} / {col.max():7.1f}")
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +426,13 @@ class ArgsConfig:
     chunk_size_threshold: float = 0.5
     dt: float = 0.05
     wait: bool = False
+    # Number of queued actions sent per goal (current + lookahead-1 peeked ahead)
+    lookahead: int = 4
+    # "forward_position": servoj streaming via forward_position_controller at
+    # stream_hz (smooth; requires that controller to be active).
+    # "jtc_topic": multi-point windows on the scaled JTC command topic.
+    control_interface: Literal["forward_position", "jtc_topic"] = "forward_position"
+    stream_hz: float = 125.0
     aggregate_fn_name: Literal["weighted_average", "latest_only", "average", "conservative"] = "conservative"
 
     # Within-chunk batch smoothing (applied to full inference chunk before queue insertion)
@@ -325,6 +448,19 @@ class ArgsConfig:
     filter_beta: float = 0.1
 
 
+def home_via_fpc(sensor: UR5SensorNode, duration: float = 4.0, hz: float = 125.0):
+    """Move to home by streaming a smoothstep interpolation to forward_position_controller."""
+    state = sensor.get_joint_state()
+    cur = state[[5, 0, 1, 2, 3, 4]].astype(float)
+    target = np.asarray(HOME_JOINT_POSITIONS, dtype=float)
+    n = max(1, int(duration * hz))
+    for i in range(1, n + 1):
+        a = i / n
+        s = 3 * a * a - 2 * a * a * a  # smoothstep: zero velocity at both ends
+        sensor.publish_fpc(cur + s * (target - cur))
+        time.sleep(1.0 / hz)
+
+
 def main(args: ArgsConfig):
     rclpy.init()
     sensor = UR5SensorNode()
@@ -337,7 +473,10 @@ def main(args: ArgsConfig):
     print("Sensors ready.")
 
     print("Moving to home position...")
-    sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
+    if args.control_interface == "forward_position":
+        home_via_fpc(sensor)
+    else:
+        sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
     sensor.send_gripper_command(0.0)
     print("Home position reached.")
 
@@ -351,6 +490,9 @@ def main(args: ArgsConfig):
         chunk_size_threshold=args.chunk_size_threshold,
         dt=args.dt,
         wait=args.wait,
+        lookahead=args.lookahead,
+        control_interface=args.control_interface,
+        stream_hz=args.stream_hz,
         aggregate_fn_name=args.aggregate_fn_name,
         chunk_filter=args.chunk_filter,
         chunk_filter_q=args.chunk_filter_q,
@@ -361,6 +503,9 @@ def main(args: ArgsConfig):
         filter_mincutoff=args.filter_mincutoff,
         filter_beta=args.filter_beta,
     )
+
+    # First streamed segment starts from the home pose we just reached
+    client._last_target = np.asarray(HOME_JOINT_POSITIONS, dtype=float)
 
     try:
         client.run(num_steps=args.num_steps)

@@ -22,6 +22,7 @@ import sys
 
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 from PIL import Image
@@ -229,6 +230,29 @@ def process_image(args, image_path, processor, model, device, image=None, label=
         attn_map = cross_attn[:, args.head].mean(dim=0)
         _plot_head_averaged(attn_map, token_labels, grid_dim, image, out_stem, args,
                             num_total_layers=num_layers, head_idx=args.head)
+    elif args.heads:
+        # Parse heads specification (e.g., "9-12" or "0,1,2,3")
+        head_indices = []
+        for part in args.heads.split(","):
+            part = part.strip()
+            if "-" in part:
+                start, end = map(int, part.split("-"))
+                head_indices.extend(range(start, end + 1))
+            else:
+                head_indices.append(int(part))
+        # Validate
+        for h in head_indices:
+            if h < 0 or h >= num_heads:
+                raise ValueError(f"Head index {h} out of range [0, {num_heads - 1}]")
+        # Select heads, average across layers → (selected_heads, text_tokens, patches)
+        attn_map = cross_attn[:, head_indices].mean(dim=0)
+        if args.per_head:
+            _plot_per_head(attn_map, token_labels, grid_dim, image, out_stem, args)
+        else:
+            # Average across selected heads → (text_tokens, patches)
+            attn_map = attn_map.mean(dim=0)
+            _plot_head_averaged(attn_map, token_labels, grid_dim, image, out_stem, args,
+                                num_total_layers=num_layers)
     elif args.per_head:
         # Average across layers only → (heads, text_tokens, patches)
         attn_map = cross_attn.mean(dim=0)
@@ -271,6 +295,18 @@ def _plot_head_averaged(attn_map, token_labels, grid_dim, image, image_path, arg
         rgba = _make_rgba_heatmap(heatmap, image.size)
         ax.imshow(image)
         ax.imshow(rgba)
+        max_idx = attn_map[i].argmax().item()
+        max_row, max_col = max_idx // grid_dim, max_idx % grid_dim
+        W, H = image.size
+        patch_w, patch_h = W / grid_dim, H / grid_dim
+        rect = Rectangle((max_col * patch_w, max_row * patch_h), patch_w, patch_h,
+                          linewidth=2, edgecolor="white", facecolor="none")
+        ax.add_patch(rect)
+        max_score = attn_map[i].max().item()
+        ax.text(
+            0.5, -0.05, f"max attention: {max_score:.3f}", va="top", ha="center",
+            transform=ax.transAxes, fontsize=6,
+        )
         ax.set_title(f'"{label}"', fontsize=9)
         ax.axis("off")
 
@@ -310,9 +346,21 @@ def _plot_per_head(attn_map, token_labels, grid_dim, image, image_path, args):
             rgba = _make_rgba_heatmap(heatmap, image.size)
             ax.imshow(image)
             ax.imshow(rgba)
+            max_idx = attn_map[h, t].argmax().item()
+            max_row, max_col = max_idx // grid_dim, max_idx % grid_dim
+            W, H = image.size
+            patch_w, patch_h = W / grid_dim, H / grid_dim
+            rect = Rectangle((max_col * patch_w, max_row * patch_h), patch_w, patch_h,
+                              linewidth=2, edgecolor="black", facecolor="none")
+            ax.add_patch(rect)
             ax.axis("off")
             if h == 0:
                 ax.set_title(f'"{token_labels[t]}"', fontsize=7)
+            max_score = attn_map[h, t].max().item()
+            ax.text(
+                0.5, -0.05, f"{max_score:.3f}", va="top", ha="center",
+                transform=ax.transAxes, fontsize=6,
+            )
             if t == 0:
                 ax.text(
                     -0.15, 0.5, f"H{h}", va="center", ha="right",
@@ -357,6 +405,10 @@ def main():
     parser.add_argument(
         "--head", type=int, default=None,
         help="Visualize only this head index (overrides --per_head). Head-averaged if omitted.",
+    )
+    parser.add_argument(
+        "--heads", type=str, default=None,
+        help="Average over specific heads only, e.g. '9-12' or '0,1,2,3'. Overrides --per_head.",
     )
     parser.add_argument(
         "--frame_stride", type=int, default=30,

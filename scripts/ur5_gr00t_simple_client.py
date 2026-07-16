@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
 from control_msgs.action import FollowJointTrajectory, GripperCommand
-from trajectory_msgs.msg import JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float64MultiArray
 from gr00t.eval.robot import RobotInferenceClient
@@ -30,8 +30,19 @@ from pyk4a import Config, PyK4A
 # Realsense
 import pyrealsense2 as rs
 
+# Canonical arm joint order the policy was trained on (matches data_collect.py
+# JOINT_ORDER). /joint_states is name-keyed into this order in _jointstate_callback.
+JOINT_ORDER = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
 WIDTH, HEIGHT = 640, 360
-WFOV_DEVICE = 0
+WFOV_DEVICE = 2
 WFOV_DEVICE_PATH = f"/dev/video{WFOV_DEVICE}"
 
 _WFOV_V4L2_DEFAULTS = [
@@ -81,15 +92,25 @@ HOME_JOINT_POSITIONS = np.array([
 
 HOME_TOLERANCE = 0.05
 
-TASK = ["place apple in the basket.",
-        "place apple in the wooden plate.",
-        "place apple in the white plate.",
-        "place mango in the basket.",
-        "place mango in the wooden plate.",
-        "place mango in the white plate.",
-        "place green pepper in the basket.",
-        "place green pepper in the wooden plate.",
-        "place green pepper in the white plate."]
+# TASK = ["place mango in the basket.",
+#         "place mango in the wooden plate.",
+#         "place mango in the white plate.",
+#         "place apple in the basket.",
+#         "place apple in the wooden plate.",
+#         "place apple in the white plate.",
+#         "place green pepper in the basket.",
+#         "place green pepper in the wooden plate.",
+#         "place green pepper in the white plate."]
+
+TASK = ["place lemon in the basket.",
+        "place lemon in the wooden plate.",
+        "place lemon in the white plate.",
+        "place orange in the basket.",
+        "place orange in the wooden plate.",
+        "place orange in the white plate.",
+        "place yellow pepper in the basket.",
+        "place yellow pepper in the wooden plate.",
+        "place yellow pepper in the white plate."]
 
 @dataclass
 class ArgsConfig:
@@ -121,6 +142,9 @@ class ArgsConfig:
     # Controller for chunk mode: "scaled_joint_trajectory_controller" uses action server,
     # "forward_position_controller" publishes Float64MultiArray directly (no interpolation)
     controller: Literal["scaled_joint_trajectory_controller", "forward_position_controller"] = "scaled_joint_trajectory_controller"
+    # Log raw (pre-filter) arm joint signal + high-rate /joint_states while inferring
+    # (between 's' and 'p'), for later inspection with plot_streaming_log.py
+    log: bool = False
 
 
 def build_obs_dict(img1, img2, state, lang):
@@ -165,15 +189,22 @@ class UR5SensorNode(Node):
             FollowJointTrajectory,
             "/scaled_joint_trajectory_controller/follow_joint_trajectory",
         )
-        # Publisher for forward_position_controller (chunk mode only)
-        if controller == "forward_position_controller":
-            self._fpc_pub = self.create_publisher(
-                Float64MultiArray,
-                "/forward_position_controller/commands",
-                1,
-            )
-        else:
-            self._fpc_pub = None
+        # Streaming publisher: JTC command topic. Trajectories published here
+        # REPLACE the active one seamlessly (sampled from current desired state),
+        # unlike action goals whose preemption inserts a hold + zero-velocity
+        # restart, which causes visible stop-and-go at streaming rates.
+        self._jt_stream_pub = self.create_publisher(
+            JointTrajectory,
+            "/scaled_joint_trajectory_controller/joint_trajectory",
+            1,
+        )
+        # Publisher for forward_position_controller (servoj streaming).
+        # Always created: publishing to an inactive controller is harmless.
+        self._fpc_pub = self.create_publisher(
+            Float64MultiArray,
+            "/forward_position_controller/commands",
+            1,
+        )
         # Action client: Robotiq gripper
         self._gripper_action = ActionClient(
             self,
@@ -254,8 +285,16 @@ class UR5SensorNode(Node):
 
     # -- ROS2 callbacks --
     def _jointstate_callback(self, msg):
+        # /joint_states arrives in a driver-dependent, non-canonical order
+        # (e.g. [pan, w2, w3, w1, elbow, lift]). Key by name into the canonical
+        # [pan, lift, elbow, w1, w2, w3] order the policy was trained on, exactly
+        # like data_collect.py — never trust the raw msg.position order.
+        name_to_pos = dict(zip(msg.name, msg.position))
+        pos = np.array([name_to_pos[j] for j in JOINT_ORDER], dtype=np.float32)
         with self.joint_lock:
-            self.latest_joint_position = np.array(list(msg.position), dtype=np.float32)
+            self.latest_joint_position = pos
+        if getattr(self, "js_recording", False):
+            self.js_log.append((time.perf_counter(), *pos))
 
     def _gripper_callback(self, msg):
         with self.gripper_lock:
@@ -442,6 +481,29 @@ class UR5SensorNode(Node):
             )
             return False
 
+    def send_window_scaled_joint(self, arm_window, dt: float, velocities_window=None):
+        """Fire-and-forget multi-point lookahead trajectory (streaming mode).
+
+        Publishes on the JTC command topic rather than the action interface:
+        topic trajectories replace the active one seamlessly (sampled from the
+        current desired state), while action-goal preemption inserts a hold and
+        restarts from zero velocity — visible stop-and-go at streaming rates.
+        Sending several future points per tick keeps the controller mid-spline
+        when the next message supersedes this one.
+        """
+        traj = JointTrajectory()
+        traj.joint_names = self.scaled_joint_names_reordered
+        for i, positions in enumerate(arm_window):
+            point = JointTrajectoryPoint()
+            point.positions = np.atleast_1d(positions).tolist()
+            if velocities_window is not None:
+                point.velocities = np.atleast_1d(velocities_window[i]).tolist()
+            t = (i + 1) * dt
+            point.time_from_start = Duration(sec=int(t), nanosec=int((t % 1) * 1e9))
+            traj.points.append(point)
+        self._jt_stream_pub.publish(traj)
+        return True
+
     def send_chunk_action(self, arm_actions, dt):
         """Send full action chunk as one trajectory goal; controller spline-interpolates."""
         goal = FollowJointTrajectory.Goal()
@@ -466,6 +528,16 @@ class UR5SensorNode(Node):
         result_future = goal_handle.get_result_async()
         while not result_future.done():
             time.sleep(0.01)
+
+    def publish_fpc(self, positions):
+        """Publish one position setpoint to forward_position_controller (servoj).
+
+        Joint order: scaled_joint_names_reordered ([pan, lift, elbow, w1, w2, w3]),
+        matching the controller's `joints` parameter in the default UR driver config.
+        """
+        msg = Float64MultiArray()
+        msg.data = np.atleast_1d(positions).astype(float).tolist()
+        self._fpc_pub.publish(msg)
 
     def send_chunk_action_fpc(self, arm_actions, dt):
         """Send chunk waypoints to forward_position_controller at fixed dt intervals."""
@@ -590,7 +662,7 @@ def main(args: ArgsConfig):
     print("Sensors ready.")
 
     print("Moving to home position before inference...")
-    sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
+    sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=0.3, wait=True)
     sensor.send_gripper_command(0.0, max_effort=args.gripper_max_effort)
     print("Home position reached.")
 
@@ -631,6 +703,15 @@ def main(args: ArgsConfig):
     prev_chunk_end_pos: np.ndarray | None = None  # (6,) last commanded arm position
     prev_chunk_end_vel: np.ndarray | None = None  # (6,) estimated velocity at end of chunk
 
+    # --- Joint-signal logging (raw arm chunks, only while inferring) ---
+    global_step = 0
+    log_t: list[float] = []
+    log_step: list[int] = []
+    log_chunk: list[int] = []
+    log_cmd: list[np.ndarray] = []
+    if args.log:
+        sensor.js_log = []
+
     def on_press(key):
         nonlocal inferring, returning_home, quit_flag
         try:
@@ -639,9 +720,13 @@ def main(args: ArgsConfig):
             return
         if ch == 's':
             inferring = True
+            if args.log:
+                sensor.js_recording = True
             print("[KB] Inference started")
         elif ch == 'p':
             inferring = False
+            if args.log:
+                sensor.js_recording = False
             print("[KB] Inference paused")
         elif ch == 'h':
             returning_home = True
@@ -659,19 +744,21 @@ def main(args: ArgsConfig):
     # --- Control loop ---
     try:
         cycle = 0
-        while cycle < args.num_cycles:
+        # while cycle < args.num_cycles:
+        while True:
             if quit_flag:
                 break
             if not inferring and not returning_home:
                 time.sleep(0.1)
                 continue
 
+            # Already canonical [pan, lift, elbow, w1, w2, w3, gripper] — the
+            # callback keys /joint_states by name, so no reindex is needed.
             state = sensor.get_joint_state()
-            state_reordered = state[[5, 0, 1, 2, 3, 4, 6]]
 
             # --- Return-home path: skip inference ---
             if returning_home:
-                if not is_at_home(state_reordered):
+                if not is_at_home(state):
                     sensor.send_single_action_scaled_joint(HOME_JOINT_POSITIONS, dt=3.0, wait=True)
                     sensor.send_gripper_command(0.0, max_effort=args.gripper_max_effort)
                 if use_random_task:
@@ -694,7 +781,7 @@ def main(args: ArgsConfig):
                 if img2 is not None:
                     cv2.imwrite(f"inference_images/cycle_{cycle:04d}_wfov.jpg", cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
 
-                obs = build_obs_dict(img1, img2, state_reordered, args.lang)
+                obs = build_obs_dict(img1, img2, state, args.lang)
 
                 t0 = time.perf_counter()
                 action_dict = client.get_action(obs)
@@ -702,6 +789,15 @@ def main(args: ArgsConfig):
 
                 arm_actions = np.atleast_2d(action_dict["action.ur5_arm"])   # (H, 6)
                 gripper_actions = np.atleast_1d(action_dict["action.gripper"]).flatten()  # (H,)
+
+                if args.log:
+                    t_cycle_start = time.perf_counter()
+                    for i in range(args.action_horizon):
+                        log_t.append(t_cycle_start + (i + 1) * args.dt)
+                        log_step.append(global_step)
+                        log_chunk.append(cycle)
+                        log_cmd.append(np.asarray(arm_actions[i], dtype=np.float64).copy())
+                        global_step += 1
 
                 arm_chunk = []
                 grip_chunk = []
@@ -782,6 +878,18 @@ def main(args: ArgsConfig):
             cycle += 1
     finally:
         kb_listener.stop()
+        if args.log:
+            sensor.js_recording = False
+            if log_t:
+                np.savez(
+                    "simple_client_log.npz",
+                    t=np.array(log_t),
+                    step=np.array(log_step),
+                    chunk=np.array(log_chunk),
+                    cmd=np.array(log_cmd),
+                    js=np.array(sensor.js_log) if sensor.js_log else np.zeros((0, 7)),
+                )
+                print(f"Diagnostic log saved: simple_client_log.npz ({len(log_t)} waypoints)")
         sensor.stop()
         sensor.destroy_node()
         rclpy.shutdown()

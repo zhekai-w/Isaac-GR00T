@@ -37,6 +37,18 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
+# These figures are read zoomed-out or pasted into slides, so the matplotlib
+# defaults (10 pt) are too small to read.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.labelsize": 22,
+    "axes.titlesize": 24,
+    "xtick.labelsize": 19,
+    "ytick.labelsize": 19,
+    "legend.fontsize": 20,
+    "figure.titlesize": 26,
+})
+
 sys.path.insert(0, os.path.dirname(__file__))
 from filter_utils import OneEuroFilter, savgol_chunk, rts_smoother_chunk
 
@@ -102,7 +114,7 @@ def main(paths, seconds, legend, args):
 
     colors = plt.cm.tab10(np.linspace(0, 1, 10))
 
-    fig, axes = plt.subplots(6, 1, figsize=(7, 20), constrained_layout=True,
+    fig, axes = plt.subplots(6, 1, figsize=(7, 15), constrained_layout=True,
                              sharex=True)
 
     print(f"filter = {args.filter}")
@@ -139,13 +151,20 @@ def main(paths, seconds, legend, args):
         axes[j].set_ylabel(f"{JOINT_NAMES[j]}\n|jerk| (rad/s³)")
         axes[j].set_yscale("log")
         axes[j].grid(True, which="both", alpha=0.3)
-    axes[0].legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.9)
+    # ncol=1 at this width: constrained_layout cannot shrink a legend, so a
+    # wide one steals the space from the axes instead.
+    axes[0].legend(loc="upper right", fontsize=12, ncol=1, framealpha=0.9)
     axes[-1].set_xlabel("time (s)")
+    # Same pinned x range as plot_interchunk_diff.py: jerk is only defined from
+    # the 4th sample on, so autoscaling would start these axes at t~0.2 s and
+    # the two figures would not share a scale.
+    axes[-1].set_xlim(0.0, seconds if seconds is not None else float(tj[-1]))
 
-    title = f"joint jerk before/after {args.filter} filter — {len(paths)} logs overlaid"
+    # Wrapped: the one-line form is wider than the 7 in figure at this font size.
+    title = f"joint jerk before/after {args.filter} filter\n{len(paths)} logs overlaid"
     if seconds is not None:
         title += f", first {seconds:g}s"
-    fig.suptitle(title, fontsize=12)
+    fig.suptitle(title, fontsize=16)
 
     out = "jerk_filter.png"
     fig.savefig(out, dpi=120)

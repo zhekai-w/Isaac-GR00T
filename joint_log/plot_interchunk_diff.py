@@ -24,6 +24,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# These figures are read zoomed-out or pasted into slides, so the matplotlib
+# defaults (10 pt) are too small to read.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.labelsize": 22,
+    "axes.titlesize": 24,
+    "xtick.labelsize": 19,
+    "ytick.labelsize": 19,
+    "legend.fontsize": 20,
+    "figure.titlesize": 26,
+})
+
 JOINT_NAMES = ["pan", "lift", "elbow", "wrist1", "wrist2", "wrist3"]
 
 
@@ -59,7 +71,10 @@ def main(path: str = "simple_client_log.npz", seconds: float | None = None):
     boundary_diff = cmd[boundary_idx] - cmd[boundary_idx - 1]  # (num_boundaries, 6)
     mag = np.abs(boundary_diff)
 
-    fig, axes = plt.subplots(7, 1, figsize=(7, 20), constrained_layout=True)
+    # sharex + 2.5 in per panel, matching plot_jerk_filter.py (6 panels / 15 in):
+    # only the bottom panel carries tick labels.
+    fig, axes = plt.subplots(7, 1, figsize=(7, 17.5), constrained_layout=True,
+                             sharex=True)
 
     # Panel 1-6: per-joint commanded (+ measured) position, chunk boundaries marked
     for j in range(6):
@@ -71,7 +86,7 @@ def main(path: str = "simple_client_log.npz", seconds: float | None = None):
             ax.axvline(t[bi], color="gray", ls="--", lw=0.6, alpha=0.5)
         ax.set_ylabel(f"{JOINT_NAMES[j]} (rad)")
         if j == 0:
-            ax.legend(loc="upper right")
+            ax.legend(loc="upper right", fontsize=12)
 
     # Match wrist2's y-axis scale (span) to pan's, but keep it centered on
     # wrist2's own data so the values stay visible.
@@ -87,16 +102,24 @@ def main(path: str = "simple_client_log.npz", seconds: float | None = None):
     boundary_t = t[boundary_idx]
     for j in range(6):
         ax.plot(boundary_t, mag[:, j], "-o", ms=4, lw=1, label=JOINT_NAMES[j])
-    ax.set_ylabel("inter-chunk |Δ| (rad)")
+    # Two lines: at 22 pt this label is taller than its (short) panel and
+    # overruns the one above it.
+    ax.set_ylabel("inter-chunk\n|Δ| (rad)")
     ax.set_xlabel("time (s)")
     ax.set_ylim(0.0, 0.06)
-    ax.legend(loc="upper right", ncol=6, fontsize=8)
+    # Pin the shared x range to the requested window rather than letting each
+    # script autoscale to its own data: jerk plots start at the 4th sample, so
+    # autoscaled limits differ by a few percent and the two figures no longer
+    # share a scale.
+    ax.set_xlim(0.0, seconds if seconds is not None else float(t[-1]))
+    ax.legend(loc="upper right", ncol=3, fontsize=12)
 
     overall_max_j = int(np.unravel_index(mag.argmax(), mag.shape)[1])
+    # Wrapped: the one-line form is wider than the 7 in figure at this font size.
     summary = (f"mean max|Δ|={mag.max(axis=1).mean():.4f} rad, "
-               f"median={np.median(mag.max(axis=1)):.4f} rad, "
+               f"median={np.median(mag.max(axis=1)):.4f} rad\n"
                f"max={mag.max():.4f} rad (joint {JOINT_NAMES[overall_max_j]})")
-    fig.suptitle(summary, fontsize=12)
+    fig.suptitle(summary, fontsize=16)
 
     out = path.replace(".npz", "_interchunk.png")
     fig.savefig(out, dpi=120)
